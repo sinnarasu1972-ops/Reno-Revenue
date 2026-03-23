@@ -64,19 +64,51 @@ BRANCH_CODE_TO_NAME = {
 
 ORIGINAL_CSV_COLS = []  # populated by load_data()
 
+# Only load columns we actually need — saves ~60% memory vs full load
+KEEP_COLS = [
+    "Repair Order#",
+    "RO Owner First Name",
+    "RO Owner Last Name",
+    "Vehicle Model",
+    "Vehicle Reg#",
+    "Invoice Date",
+    "Repair Order Date",
+    "Net Taxable Labor Amount",
+    "Net Taxable Parts Amt",
+    "Service Type",
+    "Invoice Type",
+    "Status",
+    "Invoice Status",
+    "RO Status",
+]
+
+def _read_lean(path: str, label: str) -> pd.DataFrame:
+    """Read only KEEP_COLS that exist in this file, dtype=str minimises peak RAM."""
+    try:
+        header = pd.read_csv(path, nrows=0)
+        header.columns = header.columns.str.strip()
+        use = [c for c in KEEP_COLS if c in header.columns]
+        tmp = pd.read_csv(path, usecols=use, dtype=str, low_memory=False)
+        tmp.columns = tmp.columns.str.strip()
+        tmp["CY"] = label
+        logger.info(f"Loaded {path}: {len(tmp)} rows, {len(tmp.columns)} cols")
+        return tmp
+    except Exception as e:
+        logger.error(f"Failed to load {path}: {e}")
+        return pd.DataFrame()
+
+
 def load_data():
+    global ORIGINAL_CSV_COLS
+
     frames = []
     for path, label in [(CY24_PATH, "CY24"), (CY25_PATH, "CY25"), (CY26_PATH, "CY26")]:
         if not os.path.exists(path):
             logger.warning(f"Skipping missing file: {path}")
             continue
-        try:
-            tmp = pd.read_csv(path, low_memory=False)
-            tmp["CY"] = label
+        tmp = _read_lean(path, label)
+        if not tmp.empty:
             frames.append(tmp)
-            logger.info(f"Loaded {path}: {len(tmp)} rows")
-        except Exception as e:
-            logger.error(f"Failed to load {path}: {e}")
         gc.collect()
 
     if not frames:
@@ -87,57 +119,82 @@ def load_data():
     del frames
     gc.collect()
 
-    # Strip column names
-    df.columns = df.columns.str.strip()
+    # Capture original CSV column order BEFORE adding computed cols
+    ORIGINAL_CSV_COLS = [c for c in df.columns if c != "CY"]
 
-    # ── Capture original CSV column order BEFORE adding computed cols ──
-    global ORIGINAL_CSV_COLS
-    ORIGINAL_CSV_COLS = list(df.columns)
+    # Division (branch code -> name)
+    _raw_div = df["Repair Order#"].astype(str).str[2:6]
+    df["Division"] = _raw_div.map(BRANCH_CODE_TO_NAME).fillna(_raw_div)
 
-    df["Division"] = df["Repair Order#"].astype(str).str[2:6].map(BRANCH_CODE_TO_NAME).fillna(df["Repair Order#"].astype(str).str[2:6])
-    df["SA Name"]  = df["RO Owner First Name"].astype(str) + " " + df["RO Owner Last Name"].astype(str)
-    df["Model"]    = df["Vehicle Model"].astype(str).str.strip().str.split().str[0].str.upper()
+    # SA Name
+    first = df.get("RO Owner First Name", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
+    last  = df.get("RO Owner Last Name",  pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
+    df["SA Name"] = (first + " " + last).str.strip()
 
-    # Format in CSV: "01-01-2025 10:06:00"  (DD-MM-YYYY HH:MM:SS)
-    # Slice first 10 chars -> "01-01-2025", ignore time part
+    # Model (first word, upper)
+    if "Vehicle Model" in df.columns:
+        df["Model"] = df["Vehicle Model"].fillna("").astype(str).str.strip().str.split().str[0].str.upper()
+
+    # Dates: DD-MM-YYYY or DD/MM/YYYY HH:MM:SS
     for date_col in ["Invoice Date", "Repair Order Date"]:
-        raw_date = df[date_col].astype(str).str.strip().str[:10]
-        df[date_col] = pd.to_datetime(raw_date, format="%d-%m-%Y", errors="coerce")
-        mask = df[date_col].isna()
+        if date_col not in df.columns:
+            continue
+        raw = df[date_col].astype(str).str.strip().str[:10]
+        parsed = pd.to_datetime(raw, format="%d-%m-%Y", errors="coerce")
+        mask = parsed.isna()
         if mask.any():
-            df.loc[mask, date_col] = pd.to_datetime(
-                raw_date[mask], format="%d/%m/%Y", errors="coerce"
-            )
+            parsed[mask] = pd.to_datetime(raw[mask], format="%d/%m/%Y", errors="coerce")
+        df[date_col] = parsed
 
-    df["Month"] = df["Invoice Date"].dt.strftime("%b")  # Jan, Feb, Mar ...
+    # Month
+    if "Invoice Date" in df.columns:
+        df["Month"] = df["Invoice Date"].dt.strftime("%b")
 
-    # TAT = Invoice Date - Repair Order Date (in days)
-    df["TAT (Days)"] = (df["Invoice Date"] - df["Repair Order Date"]).dt.days
+    # TAT (Int16 saves memory vs int64)
+    if "Invoice Date" in df.columns and "Repair Order Date" in df.columns:
+        df["TAT (Days)"] = (df["Invoice Date"] - df["Repair Order Date"]).dt.days.astype("Int16")
 
+    # Amounts as float32 (half the memory of float64)
     for col in ["Net Taxable Labor Amount", "Net Taxable Parts Amt"]:
-        df[col] = (
-            df[col].astype(str)
-            .str.replace("Rs.", "", regex=False)
-            .str.replace(",",   "", regex=False)
-            .pipe(pd.to_numeric, errors="coerce")
-            .fillna(0)
-        )
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str)
+                .str.replace("Rs.", "", regex=False)
+                .str.replace(",",   "", regex=False)
+                .pipe(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .astype(np.float32)
+            )
+        else:
+            df[col] = np.float32(0)
 
-    # Split Cancelled vs Active — works whether column is "Status" or "Invoice Status"
-    status_col = None
-    for c in df.columns:
-        if c.strip().lower() in ("status", "invoice status", "ro status"):
-            status_col = c
-            break
+    # Downcast low-cardinality string columns to category
+    for col in ["CY", "Division", "Service Type", "Invoice Type", "Model", "Month", "SA Name"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
+    gc.collect()
+    logger.info(f"RAM after enrich: {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+
+    # Status split
+    status_col = next(
+        (c for c in df.columns if c.strip().lower() in ("status", "invoice status", "ro status")),
+        None
+    )
     if status_col:
         cancelled_mask = df[status_col].astype(str).str.strip().str.lower() == "cancelled"
+        logger.info(f"Status col: '{status_col}' | Cancelled: {cancelled_mask.sum()}")
     else:
         cancelled_mask = pd.Series(False, index=df.index)
+        logger.warning("No status column found — treating all rows as active")
 
     df_cancelled = df[cancelled_mask].copy()
     df_active    = df[~cancelled_mask].copy()
+    del df
+    gc.collect()
 
+    logger.info(f"Active: {len(df_active)} | Cancelled: {len(df_cancelled)}")
+    logger.info(f"Final RAM: {df_active.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
     return df_active, df_cancelled
 
 
