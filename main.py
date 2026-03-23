@@ -1504,6 +1504,7 @@ def dashboard():
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Renault Service Revenue Dashboard v6</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1528,7 +1529,16 @@ body {
 .header h2 { font-size: 22px; color: #222; }
 
 /* ---------- TABS ---------- */
-.tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 2px solid #e5e7eb; }
+.tabs-wrap { position: relative; margin-bottom: 24px; }
+.tabs { display: flex; gap: 4px; border-bottom: 2px solid #e5e7eb; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab-scroll-hint {
+  display: none;
+  position: absolute; right: 0; top: 0; bottom: 2px;
+  width: 32px; background: linear-gradient(to right, transparent, #fff 60%);
+  align-items: center; justify-content: flex-end; padding-right: 4px;
+  font-size: 20px; color: #4f6bdc; pointer-events: none;
+}
 .tab-btn {
     padding: 10px 24px;
     border: none;
@@ -1780,6 +1790,197 @@ tbody tr:hover { background: #f4f6ff; }
   0%, 100% { opacity: 1; transform: scale(1); }
   50%       { opacity: .4; transform: scale(1.3); }
 }
+
+/* ============================================================
+   RESPONSIVE — Mobile / Tablet / Laptop / Desktop
+   Breakpoints:
+     xs  mobile portrait  : < 480px
+     sm  mobile landscape : 480–767px
+     md  tablet           : 768–1023px
+     lg  laptop           : 1024–1279px
+     xl  desktop          : 1280px+
+   ============================================================ */
+
+/* ── Base: body padding shrinks on small screens ── */
+@media (max-width: 767px) {
+  body { padding: 0; background: #f0f2ff; }
+  .container { border-radius: 0; padding: 14px 12px; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  body { padding: 12px; }
+  .container { padding: 20px 18px; }
+}
+
+/* ── HEADER ── */
+@media (max-width: 767px) {
+  .header { flex-direction: column; align-items: flex-start; gap: 6px; margin-bottom: 14px; }
+  .header h2 { font-size: 17px; line-height: 1.3; }
+}
+
+/* ── TABS — horizontal scroll on small screens ── */
+@media (max-width: 767px) {
+  .tabs {
+    flex-wrap: nowrap;
+    gap: 0;
+    margin-bottom: 0;
+  }
+  .tabs-wrap { margin-bottom: 16px; }
+  .tab-scroll-hint { display: flex; }
+  .tab-btn {
+    padding: 9px 14px;
+    font-size: 12px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    border-radius: 0;
+  }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  .tabs { flex-wrap: wrap; gap: 2px; }
+  .tab-btn { padding: 8px 14px; font-size: 13px; }
+}
+
+/* ── CARDS ── */
+@media (max-width: 479px) {
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { padding: 12px 10px; }
+  .card .value { font-size: 16px; }
+  .card .label { font-size: 10px; margin-bottom: 5px; }
+}
+@media (min-width: 480px) and (max-width: 767px) {
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .card { padding: 12px 10px; }
+  .card .value { font-size: 15px; }
+  .card .label { font-size: 10px; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .card .value { font-size: 18px; }
+}
+
+/* ── FILTER BAR ── */
+@media (max-width: 479px) {
+  .filter-bar { padding: 12px 10px; gap: 10px; }
+  .fg { min-width: calc(50% - 5px); flex: none; }
+  .fg label { font-size: 10px; }
+  .fg select#cy { font-size: 12px; height: 32px; }
+  .cs-face { font-size: 12px; height: 32px; }
+  .apply-btn, .export-btn, .reset-btn {
+    height: 32px; font-size: 12px;
+    padding: 0 12px; flex: 1;
+  }
+}
+@media (min-width: 480px) and (max-width: 767px) {
+  .filter-bar { padding: 12px; gap: 10px; }
+  .fg { min-width: calc(50% - 5px); flex: none; }
+  .apply-btn, .export-btn, .reset-btn { height: 32px; font-size: 13px; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  .fg { min-width: 140px; }
+}
+
+/* Buttons row on mobile — full width row */
+@media (max-width: 479px) {
+  .filter-bar .apply-btn,
+  .filter-bar .export-btn,
+  .filter-bar .reset-btn {
+    width: 100%;
+    flex: 1 1 calc(33% - 8px);
+    min-width: 80px;
+  }
+}
+
+/* ── TABLES — horizontal scroll + smaller text ── */
+@media (max-width: 767px) {
+  .table-wrap, .op-wrap, .pivot-wrap { border-radius: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table, .comp-table, .pivot-table, .op-table { font-size: 11px; min-width: 540px; }
+  th, td { padding: 7px 8px; }
+  .comp-table th, .comp-table td { padding: 7px 8px; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  table, .comp-table, .pivot-table, .op-table { font-size: 12px; }
+  th, td { padding: 8px 10px; }
+}
+
+/* ── COMPARISON SECTION HEADINGS ── */
+@media (max-width: 767px) {
+  .comp-section h3 { font-size: 13px; }
+  .pivot-section h3 { font-size: 13px; }
+}
+
+/* ── PCT BADGES — smaller on mobile ── */
+@media (max-width: 767px) {
+  .pct, .pct-up, .pct-down, .pct-flat { font-size: 10px; padding: 1px 5px; }
+}
+
+/* ── ONE PAGER TABLE ── */
+@media (max-width: 767px) {
+  .op-table th.desc-hdr { min-width: 140px; }
+  .op-table th.div-hdr  { min-width: 60px; }
+  .op-table th, .op-table td { padding: 6px 8px; font-size: 10px; }
+}
+
+/* ── CURRENT MONTH cards stack on mobile ── */
+@media (max-width: 479px) {
+  #page5 .cards { grid-template-columns: 1fr 1fr; }
+}
+@media (min-width: 480px) and (max-width: 767px) {
+  #page5 .cards { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* ── LIVE BADGE row wraps ── */
+@media (max-width: 479px) {
+  #page5 > div[style*="display:flex"] {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+}
+
+/* ── Division summary table on Page 5 — very wide, always scroll ── */
+@media (max-width: 1279px) {
+  #cm-div-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #cm-div-wrap table { min-width: 900px; }
+}
+@media (max-width: 767px) {
+  #cm-div-wrap table { font-size: 10px; }
+  #cm-div-wrap th, #cm-div-wrap td { padding: 5px 6px; }
+  #cm-mtd-wrap table { min-width: 320px; font-size: 11px; }
+}
+
+/* ── Container max-width steps ── */
+@media (min-width: 1280px)  { .container { max-width: 1400px; } }
+@media (min-width: 1024px) and (max-width: 1279px) { .container { max-width: 1200px; } }
+@media (min-width: 768px)  and (max-width: 1023px) { .container { max-width: 960px;  } }
+
+/* ── Sticky first-column on pivot/op tables ── */
+@media (max-width: 767px) {
+  .pivot-table td:first-child,
+  .op-table td.desc-cell { min-width: 90px; font-size: 10px; }
+}
+
+/* ── Touch-friendly tap targets ── */
+@media (hover: none) and (pointer: coarse) {
+  .tab-btn   { min-height: 42px; }
+  .cs-item   { min-height: 38px; padding: 8px 12px; }
+  .cs-sa-btn { min-height: 34px; }
+  .apply-btn, .export-btn, .reset-btn { min-height: 38px; }
+}
+
+/* ── cs-panel: fix dropdown going off-screen on mobile ── */
+@media (max-width: 767px) {
+  .cs-panel {
+    position: fixed;
+    left: 8px !important;
+    right: 8px !important;
+    width: auto !important;
+    top: auto !important;
+    bottom: 0;
+    border-radius: 12px 12px 0 0;
+    max-height: 60vh;
+    box-shadow: 0 -4px 24px rgba(0,0,0,.18);
+    z-index: 9999;
+  }
+}
+
 </style>
 </head>
 
@@ -1792,13 +1993,16 @@ tbody tr:hover { background: #f4f6ff; }
   </div>
 
   <!-- TABS -->
-  <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('page1', this)">Invoice Data</button>
-    <button class="tab-btn"        onclick="switchTab('page2', this)">CY Comparison</button>
-    <button class="tab-btn"        onclick="switchTab('page3', this)">Division-Month</button>
-    <button class="tab-btn"        onclick="switchTab('page4', this)">One Pager Report</button>
-    <button class="tab-btn"        onclick="switchTab('page5', this)">Current Month (Mar)</button>
-    <button class="tab-btn"        onclick="switchTab('page6', this)">Division-Month CY26</button>
+  <div class="tabs-wrap">
+    <div class="tabs" id="tabsEl">
+      <button class="tab-btn active" onclick="switchTab('page1', this)">Invoice Data</button>
+      <button class="tab-btn"        onclick="switchTab('page2', this)">CY Comparison</button>
+      <button class="tab-btn"        onclick="switchTab('page3', this)">Division-Month</button>
+      <button class="tab-btn"        onclick="switchTab('page4', this)">One Pager Report</button>
+      <button class="tab-btn"        onclick="switchTab('page5', this)">Current Month (Mar)</button>
+      <button class="tab-btn"        onclick="switchTab('page6', this)">Division-Month CY26</button>
+    </div>
+    <div class="tab-scroll-hint" id="tabScrollHint">&#8250;</div>
   </div>
 
   <!-- ==================== PAGE 1 ==================== -->
@@ -2132,6 +2336,9 @@ tbody tr:hover { background: #f4f6ff; }
 
 </div><!-- /container -->
 
+<!-- Mobile dropdown backdrop -->
+<div id="mob-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9998;" onclick="closeAllPanels()"></div>
+
 <script>
 /* ====================================================
    TAB SWITCHING
@@ -2177,22 +2384,40 @@ function buildCustomSelect(container) {
     document.getElementById("face-" + key).addEventListener("click", (e) => {
         e.stopPropagation(); togglePanel(key);
     });
+    // Mobile: close panel when tapping outside
+    document.getElementById("panel-" + key).addEventListener("click", (e) => {
+        e.stopPropagation();
+    });
     document.getElementById("search-" + key).addEventListener("input", (e) => {
         filterList(key, e.target.value.toLowerCase());
     });
+}
+
+function closeAllPanels() {
+    document.querySelectorAll(".cs-panel.open").forEach(p => {
+        p.classList.remove("open");
+        var faceEl = document.getElementById("face-" + p.id.replace("panel-",""));
+        if (faceEl) faceEl.classList.remove("open");
+    });
+    var bd = document.getElementById("mob-backdrop");
+    if (bd) bd.style.display = "none";
 }
 
 function togglePanel(key) {
     document.querySelectorAll(".cs-panel.open").forEach(p => {
         if (p.id !== "panel-" + key) {
             p.classList.remove("open");
-            document.getElementById("face-" + p.id.replace("panel-","")).classList.remove("open");
+            var faceEl = document.getElementById("face-" + p.id.replace("panel-",""));
+            if (faceEl) faceEl.classList.remove("open");
         }
     });
     const panel = document.getElementById("panel-" + key);
     const face  = document.getElementById("face-"  + key);
     panel.classList.toggle("open");
     face.classList.toggle("open", panel.classList.contains("open"));
+    // Show/hide mobile backdrop
+    var bd = document.getElementById("mob-backdrop");
+    if (bd) bd.style.display = panel.classList.contains("open") ? "block" : "none";
 }
 
 
@@ -2203,12 +2428,7 @@ function updateFace(key) {
     face.textContent  = sel.size === 0 ? placeholder : sel.size === 1 ? [...sel][0] : sel.size + " selected";
 }
 
-document.addEventListener("click", () => {
-    document.querySelectorAll(".cs-panel.open").forEach(p => {
-        p.classList.remove("open");
-        document.getElementById("face-" + p.id.replace("panel-","")).classList.remove("open");
-    });
-});
+document.addEventListener("click", () => { closeAllPanels(); });
 
 /* ====================================================
    API HELPERS
@@ -2885,6 +3105,21 @@ async function loadDivMonth26() {
    INIT
    ==================================================== */
 window.onload = function () {
+    // Tab scroll hint — hide when scrolled to end
+    var tabsEl = document.getElementById("tabsEl");
+    var hint   = document.getElementById("tabScrollHint");
+    if (tabsEl && hint) {
+        tabsEl.addEventListener("scroll", function() {
+            var atEnd = tabsEl.scrollLeft + tabsEl.clientWidth >= tabsEl.scrollWidth - 4;
+            hint.style.display = atEnd ? "none" : "flex";
+        });
+        // Scroll active tab into view on tab switch
+        document.querySelectorAll(".tab-btn").forEach(function(btn) {
+            btn.addEventListener("click", function() {
+                btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+            });
+        });
+    }
     document.querySelectorAll(".custom-select").forEach(buildCustomSelect);
     loadFilters();
     loadCards();
