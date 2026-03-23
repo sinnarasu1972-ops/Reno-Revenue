@@ -1,2 +1,2 @@
-3.12.10
- 
+Key:   PYTHON_VERSION
+Value: 3.12.10
