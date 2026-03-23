@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from typing import List, Optional
 import pandas as pd
 import numpy as np
@@ -30,7 +31,6 @@ df = pd.DataFrame()
 df_cancelled = pd.DataFrame()
 
 # ================= COLUMNS TO KEEP =================
-# Only load columns actually needed — drops everything else to save memory
 KEEP_COLS = [
     "Repair Order#",
     "RO Owner First Name",
@@ -43,7 +43,6 @@ KEEP_COLS = [
     "Service Type",
     "Invoice Type",
     "Status",
-    # alternate status column names
     "Invoice Status",
     "RO Status",
 ]
@@ -58,23 +57,14 @@ def indian_format(n):
 
 
 def read_csv_lean(path: str, label: str) -> pd.DataFrame:
-    """Read only needed columns, use smallest possible dtypes."""
     if not os.path.exists(path):
         logger.warning(f"File not found, skipping: {path}")
         return pd.DataFrame()
-
     try:
-        # First pass: find which KEEP_COLS actually exist in this file
         header = pd.read_csv(path, nrows=0, low_memory=False)
         header.columns = header.columns.str.strip()
         available = [c for c in KEEP_COLS if c in header.columns]
-
-        tmp = pd.read_csv(
-            path,
-            usecols=available,
-            low_memory=False,
-            dtype=str,           # read everything as str first — lowest memory during load
-        )
+        tmp = pd.read_csv(path, usecols=available, low_memory=False, dtype=str)
         tmp.columns = tmp.columns.str.strip()
         tmp["CY"] = label
         logger.info(f"Loaded {path}: {len(tmp)} rows, {len(tmp.columns)} cols")
@@ -85,22 +75,16 @@ def read_csv_lean(path: str, label: str) -> pd.DataFrame:
 
 
 def enrich(combined: pd.DataFrame) -> pd.DataFrame:
-    """Add derived columns, parse dates, cast amounts."""
-
-    # Division from RO number
     if "Repair Order#" in combined.columns:
         combined["Division"] = combined["Repair Order#"].str[2:6]
 
-    # SA Name
     first = combined.get("RO Owner First Name", pd.Series("", index=combined.index)).fillna("").str.strip()
     last  = combined.get("RO Owner Last Name",  pd.Series("", index=combined.index)).fillna("").str.strip()
     combined["SA Name"] = (first + " " + last).str.strip()
 
-    # Model — first word only
     if "Vehicle Model" in combined.columns:
         combined["Model"] = combined["Vehicle Model"].fillna("").str.split().str[0]
 
-    # Dates
     for col in ["Invoice Date", "Repair Order Date"]:
         if col in combined.columns:
             combined[col] = pd.to_datetime(
@@ -108,13 +92,13 @@ def enrich(combined: pd.DataFrame) -> pd.DataFrame:
             )
 
     if "Invoice Date" in combined.columns:
-        combined["Month"] = combined["Invoice Date"].dt.strftime("%b")
-        combined["Year"]  = combined["Invoice Date"].dt.year.astype("Int32")
+        combined["Month"]     = combined["Invoice Date"].dt.strftime("%b")
+        combined["MonthNum"]  = combined["Invoice Date"].dt.month.astype("Int8")
+        combined["Year"]      = combined["Invoice Date"].dt.year.astype("Int32")
 
     if "Invoice Date" in combined.columns and "Repair Order Date" in combined.columns:
         combined["TAT (Days)"] = (combined["Invoice Date"] - combined["Repair Order Date"]).dt.days.astype("Int16")
 
-    # Amounts — convert to float32 (half the memory of float64)
     for col in ["Net Taxable Labor Amount", "Net Taxable Parts Amt"]:
         if col in combined.columns:
             combined[col] = (
@@ -128,7 +112,6 @@ def enrich(combined: pd.DataFrame) -> pd.DataFrame:
         else:
             combined[col] = np.float32(0)
 
-    # Downcast string columns to category (major memory saving for low-cardinality cols)
     for col in ["CY", "Division", "Service Type", "Invoice Type", "Model", "Month", "SA Name"]:
         if col in combined.columns:
             combined[col] = combined[col].astype("category")
@@ -137,13 +120,12 @@ def enrich(combined: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_data():
-    """Load CSVs one at a time, enrich, merge, split active/cancelled."""
     frames = []
     for path, label in [(CY24_PATH, "CY24"), (CY25_PATH, "CY25"), (CY26_PATH, "CY26")]:
         tmp = read_csv_lean(path, label)
         if not tmp.empty:
             frames.append(tmp)
-        gc.collect()   # free memory after each file
+        gc.collect()
 
     if not frames:
         logger.error("No CSV files loaded.")
@@ -156,7 +138,6 @@ def load_data():
     combined = enrich(combined)
     gc.collect()
 
-    # Status split
     status_col = next(
         (c for c in combined.columns if c.lower().strip() in ["status", "invoice status", "ro status"]),
         None
@@ -191,7 +172,7 @@ async def lifespan(app: FastAPI):
 
 
 # ================= APP =================
-app = FastAPI(title="Reno Revenue API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Reno Revenue API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -248,10 +229,32 @@ def apply_filters(data, division, service, sa, invoice, month, model, cy):
 
 # ================= ENDPOINTS =================
 
+@app.get("/", include_in_schema=False)
+def root():
+    """Redirect root to the dashboard."""
+    return RedirectResponse(url="/dashboard")
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    """Serve the frontend dashboard HTML."""
+    html_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h2>Dashboard not found. Place dashboard.html next to main.py.</h2>", status_code=404)
+
+
 @app.get("/health")
 def health():
     mem_mb = df.memory_usage(deep=True).sum() / 1024**2 if not df.empty else 0
-    return {"status": "ok", "active_rows": len(df), "cancelled_rows": len(df_cancelled), "df_mb": round(mem_mb, 1)}
+    return {
+        "status": "ok",
+        "active_rows": len(df),
+        "cancelled_rows": len(df_cancelled),
+        "df_mb": round(mem_mb, 1),
+        "version": "2.0.0"
+    }
 
 
 @app.get("/filters")
@@ -260,7 +263,8 @@ def filters():
         return {"error": "No data loaded"}
     def safe_unique(col):
         if col in df.columns:
-            return sorted(df[col].dropna().astype(str).unique().tolist())
+            vals = sorted(df[col].dropna().astype(str).unique().tolist())
+            return [v for v in vals if v and v.strip() and v.lower() not in ["nan", "none", ""]]
         return []
     return {
         "division": safe_unique("Division"),
@@ -289,12 +293,209 @@ def cards(
     labour = float(data["Net Taxable Labor Amount"].sum()) if "Net Taxable Labor Amount" in data.columns else 0
     spares = float(data["Net Taxable Parts Amt"].sum())    if "Net Taxable Parts Amt"    in data.columns else 0
     inflow = int(data["Repair Order#"].nunique())          if "Repair Order#"            in data.columns else 0
+    cancelled_count = int(df_cancelled.shape[0])
     return {
-        "inflow": inflow,
-        "labour": "₹ " + indian_format(labour),
-        "spares": "₹ " + indian_format(spares),
-        "total":  "₹ " + indian_format(labour + spares),
+        "inflow":    inflow,
+        "labour":    "₹ " + indian_format(labour),
+        "spares":    "₹ " + indian_format(spares),
+        "total":     "₹ " + indian_format(labour + spares),
+        "cancelled": cancelled_count,
+        "labour_raw": round(labour, 2),
+        "spares_raw": round(spares, 2),
+        "total_raw":  round(labour + spares, 2),
     }
+
+
+@app.get("/monthly-trend")
+def monthly_trend(
+    division: Optional[List[str]] = Query(None),
+    service:  Optional[List[str]] = Query(None),
+    sa:       Optional[List[str]] = Query(None),
+    invoice:  Optional[List[str]] = Query(None),
+    model:    Optional[List[str]] = Query(None),
+    cy:       Optional[str]       = Query(None),
+):
+    """Monthly revenue trend — labour + spares by month."""
+    if df.empty:
+        return []
+    data = apply_filters(df, division, service, sa, invoice, None, model, cy)
+    if "Month" not in data.columns or "MonthNum" not in data.columns:
+        return []
+
+    grp = (
+        data.groupby(["MonthNum", "Month"], observed=True)
+        .agg(
+            labour=("Net Taxable Labor Amount", "sum"),
+            spares=("Net Taxable Parts Amt", "sum"),
+            inflow=("Repair Order#", "nunique"),
+        )
+        .reset_index()
+        .sort_values("MonthNum")
+    )
+    grp["total"] = grp["labour"] + grp["spares"]
+    result = []
+    for _, row in grp.iterrows():
+        result.append({
+            "month":  str(row["Month"]),
+            "labour": round(float(row["labour"]), 2),
+            "spares": round(float(row["spares"]), 2),
+            "total":  round(float(row["total"]), 2),
+            "inflow": int(row["inflow"]),
+        })
+    return result
+
+
+@app.get("/service-mix")
+def service_mix(
+    division: Optional[List[str]] = Query(None),
+    sa:       Optional[List[str]] = Query(None),
+    invoice:  Optional[List[str]] = Query(None),
+    month:    Optional[List[str]] = Query(None),
+    model:    Optional[List[str]] = Query(None),
+    cy:       Optional[str]       = Query(None),
+):
+    """Breakdown by Service Type — count and revenue."""
+    if df.empty:
+        return []
+    data = apply_filters(df, division, None, sa, invoice, month, model, cy)
+    if "Service Type" not in data.columns:
+        return []
+    grp = (
+        data.groupby("Service Type", observed=True)
+        .agg(
+            count=("Repair Order#", "nunique"),
+            labour=("Net Taxable Labor Amount", "sum"),
+            spares=("Net Taxable Parts Amt", "sum"),
+        )
+        .reset_index()
+    )
+    grp["total"] = grp["labour"] + grp["spares"]
+    grp = grp.sort_values("total", ascending=False)
+    return [
+        {
+            "service": str(row["Service Type"]),
+            "count":   int(row["count"]),
+            "labour":  round(float(row["labour"]), 2),
+            "spares":  round(float(row["spares"]), 2),
+            "total":   round(float(row["total"]), 2),
+        }
+        for _, row in grp.iterrows()
+    ]
+
+
+@app.get("/sa-performance")
+def sa_performance(
+    division: Optional[List[str]] = Query(None),
+    service:  Optional[List[str]] = Query(None),
+    invoice:  Optional[List[str]] = Query(None),
+    month:    Optional[List[str]] = Query(None),
+    model:    Optional[List[str]] = Query(None),
+    cy:       Optional[str]       = Query(None),
+    top:      int                 = Query(10, ge=1, le=50),
+):
+    """Top SA performance by total revenue."""
+    if df.empty:
+        return []
+    data = apply_filters(df, division, service, None, invoice, month, model, cy)
+    if "SA Name" not in data.columns:
+        return []
+    grp = (
+        data.groupby("SA Name", observed=True)
+        .agg(
+            count=("Repair Order#", "nunique"),
+            labour=("Net Taxable Labor Amount", "sum"),
+            spares=("Net Taxable Parts Amt", "sum"),
+        )
+        .reset_index()
+    )
+    grp["total"] = grp["labour"] + grp["spares"]
+    grp = grp[grp["SA Name"].astype(str).str.strip() != ""].sort_values("total", ascending=False).head(top)
+    return [
+        {
+            "sa":     str(row["SA Name"]),
+            "count":  int(row["count"]),
+            "labour": round(float(row["labour"]), 2),
+            "spares": round(float(row["spares"]), 2),
+            "total":  round(float(row["total"]), 2),
+        }
+        for _, row in grp.iterrows()
+    ]
+
+
+@app.get("/model-mix")
+def model_mix(
+    division: Optional[List[str]] = Query(None),
+    service:  Optional[List[str]] = Query(None),
+    sa:       Optional[List[str]] = Query(None),
+    invoice:  Optional[List[str]] = Query(None),
+    month:    Optional[List[str]] = Query(None),
+    cy:       Optional[str]       = Query(None),
+):
+    """Revenue breakdown by vehicle model."""
+    if df.empty:
+        return []
+    data = apply_filters(df, division, service, sa, invoice, month, None, cy)
+    if "Model" not in data.columns:
+        return []
+    grp = (
+        data.groupby("Model", observed=True)
+        .agg(
+            count=("Repair Order#", "nunique"),
+            labour=("Net Taxable Labor Amount", "sum"),
+            spares=("Net Taxable Parts Amt", "sum"),
+        )
+        .reset_index()
+    )
+    grp["total"] = grp["labour"] + grp["spares"]
+    grp = grp[grp["Model"].astype(str).str.strip() != ""].sort_values("total", ascending=False)
+    return [
+        {
+            "model":  str(row["Model"]),
+            "count":  int(row["count"]),
+            "labour": round(float(row["labour"]), 2),
+            "spares": round(float(row["spares"]), 2),
+            "total":  round(float(row["total"]), 2),
+        }
+        for _, row in grp.iterrows()
+    ]
+
+
+@app.get("/cy-comparison")
+def cy_comparison(
+    division: Optional[List[str]] = Query(None),
+    service:  Optional[List[str]] = Query(None),
+    sa:       Optional[List[str]] = Query(None),
+    invoice:  Optional[List[str]] = Query(None),
+    month:    Optional[List[str]] = Query(None),
+    model:    Optional[List[str]] = Query(None),
+):
+    """Year-over-year comparison across CY24, CY25, CY26."""
+    if df.empty:
+        return []
+    data = apply_filters(df, division, service, sa, invoice, month, model, None)
+    if "CY" not in data.columns:
+        return []
+    grp = (
+        data.groupby("CY", observed=True)
+        .agg(
+            count=("Repair Order#", "nunique"),
+            labour=("Net Taxable Labor Amount", "sum"),
+            spares=("Net Taxable Parts Amt", "sum"),
+        )
+        .reset_index()
+    )
+    grp["total"] = grp["labour"] + grp["spares"]
+    grp = grp.sort_values("CY")
+    return [
+        {
+            "cy":     str(row["CY"]),
+            "count":  int(row["count"]),
+            "labour": round(float(row["labour"]), 2),
+            "spares": round(float(row["spares"]), 2),
+            "total":  round(float(row["total"]), 2),
+        }
+        for _, row in grp.iterrows()
+    ]
 
 
 @app.get("/table")
@@ -314,7 +515,6 @@ def table(
     if "Net Taxable Labor Amount" in data.columns and "Net Taxable Parts Amt" in data.columns:
         data = data.copy()
         data["Total"] = data["Net Taxable Labor Amount"] + data["Net Taxable Parts Amt"]
-    # Stringify dates and categories for JSON
     out = data.head(limit).copy()
     for col in out.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
         out[col] = out[col].astype(str)
@@ -333,10 +533,13 @@ def current_month():
     spares = float(gdf["Net Taxable Parts Amt"].sum())    if "Net Taxable Parts Amt"    in gdf.columns else 0
     inflow = int(gdf["Repair Order#"].nunique())          if "Repair Order#"            in gdf.columns else 0
     return {
-        "inflow": inflow,
-        "labour": "₹ " + indian_format(labour),
-        "spares": "₹ " + indian_format(spares),
-        "total":  "₹ " + indian_format(labour + spares),
+        "inflow":     inflow,
+        "labour":     "₹ " + indian_format(labour),
+        "spares":     "₹ " + indian_format(spares),
+        "total":      "₹ " + indian_format(labour + spares),
+        "labour_raw": round(labour, 2),
+        "spares_raw": round(spares, 2),
+        "total_raw":  round(labour + spares, 2),
     }
 
 
@@ -353,7 +556,14 @@ def cancelled(
     if df_cancelled.empty:
         return {"count": 0, "message": "No cancelled records found."}
     data = apply_filters(df_cancelled, division, service, sa, invoice, month, model, cy)
-    return {"count": int(len(data))}
+    labour = float(data["Net Taxable Labor Amount"].sum()) if "Net Taxable Labor Amount" in data.columns else 0
+    spares = float(data["Net Taxable Parts Amt"].sum())    if "Net Taxable Parts Amt"    in data.columns else 0
+    return {
+        "count":  int(len(data)),
+        "labour": "₹ " + indian_format(labour),
+        "spares": "₹ " + indian_format(spares),
+        "total":  "₹ " + indian_format(labour + spares),
+    }
 
 
 @app.get("/export")
@@ -369,13 +579,34 @@ def export(
     if df.empty:
         return JSONResponse(status_code=503, content={"error": "No data available."})
     data = apply_filters(df, division, service, sa, invoice, month, model, cy).copy()
+
+    # Add total column
+    if "Net Taxable Labor Amount" in data.columns and "Net Taxable Parts Amt" in data.columns:
+        data["Total Revenue"] = data["Net Taxable Labor Amount"] + data["Net Taxable Parts Amt"]
+
+    # Stringify for Excel
     for col in data.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
         data[col] = data[col].astype(str)
     for col in data.select_dtypes(include="category").columns:
         data[col] = data[col].astype(str)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         data.to_excel(writer, index=False, sheet_name="Invoice Data")
+
+        # Summary sheet
+        summary_data = {
+            "Metric": ["Total ROs", "Labour Revenue", "Parts Revenue", "Total Revenue", "Cancelled ROs"],
+            "Value": [
+                data["Repair Order#"].nunique() if "Repair Order#" in data.columns else 0,
+                round(float(data["Net Taxable Labor Amount"].sum()), 2) if "Net Taxable Labor Amount" in data.columns else 0,
+                round(float(data["Net Taxable Parts Amt"].sum()), 2)    if "Net Taxable Parts Amt"    in data.columns else 0,
+                round(float(data["Total Revenue"].sum()), 2)            if "Total Revenue"            in data.columns else 0,
+                len(df_cancelled),
+            ]
+        }
+        pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name="Summary")
+
     output.seek(0)
     return StreamingResponse(
         output,
