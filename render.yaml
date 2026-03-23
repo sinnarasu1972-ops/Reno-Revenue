@@ -3,18 +3,19 @@ services:
     name: reno-revenue
     env: python
     plan: free
+    pythonVersion: "3.12.10"
     buildCommand: |
       pip install --upgrade pip
       pip install --prefer-binary -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.10
+        value: "3.12.10"
       - key: CY24_PATH
-        value: Invoice Report CY24.csv
+        value: "Invoice Report CY24.csv"
       - key: CY25_PATH
-        value: Invoice Report CY25.csv
+        value: "Invoice Report CY25.csv"
       - key: CY26_PATH
-        value: Invoice Report CY26.csv
+        value: "Invoice Report CY26.csv"
       - key: GSHEET_CSV
-        value: https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv
+        value: "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv"
