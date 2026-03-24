@@ -2343,16 +2343,17 @@ tbody tr:hover { background: #f4f6ff; }
 /* ====================================================
    TAB SWITCHING
    ==================================================== */
-let compLoaded    = false;
-let divMonLoaded  = false;
-let dm26Loaded    = false;
-let opLoaded      = false;
+var compLoaded    = false;
+var divMonLoaded  = false;
+var dm26Loaded    = false;
 
 function switchTab(pageId, btn) {
-    document.querySelectorAll(".tab-page").forEach(p => p.classList.remove("active"));
-    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    closeAllPanels();
+    document.querySelectorAll(".tab-page").forEach(function(p) { p.classList.remove("active"); });
+    document.querySelectorAll(".tab-btn").forEach(function(b) { b.classList.remove("active"); });
     document.getElementById(pageId).classList.add("active");
     btn.classList.add("active");
+    btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
     if (pageId === "page2" && !compLoaded)   { loadComparison(); compLoaded = true; }
     if (pageId === "page3" && !divMonLoaded) { loadDivMonth(); divMonLoaded = true; }
     if (pageId === "page4") { loadOnePager(); }
@@ -2362,41 +2363,78 @@ function switchTab(pageId, btn) {
 
 /* ====================================================
    CUSTOM MULTI-SELECT COMPONENT
+   Three bugs fixed vs original:
+   1. filterList() was never defined — caused crash on desktop search
+   2. document.addEventListener("click") closed panels immediately on desktop
+      (mobile was fine because the backdrop intercepted taps first)
+   3. Inline onclick="selectAllVisible('${key}')" had quote-escaping issues
+      inside Python triple-quoted strings — replaced with addEventListener
    ==================================================== */
-const selections = {};
+const selections     = {};
+const _cachedOptions = {};   // full option list per key — used by reset
 
 function buildCustomSelect(container) {
-    const key         = container.dataset.key;
-    const placeholder = container.dataset.placeholder || "Select…";
-    selections[key]   = new Set();
+    var key         = container.dataset.key;
+    var placeholder = container.dataset.placeholder || "Select...";
+    selections[key] = new Set();
 
-    container.innerHTML = `
-      <div class="cs-face" id="face-${key}">${placeholder}</div>
-      <div class="cs-panel" id="panel-${key}">
-        <div class="cs-search"><input type="text" placeholder="Search…" id="search-${key}"></div>
-        <div class="cs-sel-all">
-          <button class="cs-sa-btn" onclick="selectAllVisible('${key}')">✔ Select All</button>
-          <button class="cs-sa-btn" onclick="clearSelect('${key}')">✖ Deselect All</button>
-        </div>
-        <div class="cs-list"  id="list-${key}"></div>
-      </div>`;
+    /* Build HTML without ANY inline onclick attributes.
+       Inline onclick inside a JS template literal inside a Python triple-quoted
+       string causes quote-escaping corruption. Use addEventListener instead. */
+    container.innerHTML =
+        '<div class="cs-face" id="face-' + key + '">' + placeholder + '</div>' +
+        '<div class="cs-panel" id="panel-' + key + '">' +
+          '<div class="cs-search"><input type="text" placeholder="Search..." id="search-' + key + '" autocomplete="off"></div>' +
+          '<div class="cs-sel-all">' +
+            '<button class="cs-sa-btn" type="button" id="sa-btn-' + key + '">\u2714 Select All</button>' +
+            '<button class="cs-sa-btn" type="button" id="cl-btn-' + key + '">\u2716 Deselect All</button>' +
+          '</div>' +
+          '<div class="cs-list" id="list-' + key + '"></div>' +
+        '</div>';
 
-    document.getElementById("face-" + key).addEventListener("click", (e) => {
-        e.stopPropagation(); togglePanel(key);
+    /* Wire Select All / Deselect All safely */
+    document.getElementById("sa-btn-" + key).addEventListener("click", function(e) {
+        e.stopPropagation(); selectAllVisible(key);
     });
-    // Mobile: close panel when tapping outside
-    document.getElementById("panel-" + key).addEventListener("click", (e) => {
+    document.getElementById("cl-btn-" + key).addEventListener("click", function(e) {
+        e.stopPropagation(); clearSelect(key);
+    });
+
+    /* Face: open/close, stop propagation so document handler does NOT fire */
+    document.getElementById("face-" + key).addEventListener("click", function(e) {
+        e.stopPropagation();
+        togglePanel(key);
+    });
+
+    /* Panel: stop propagation so document handler does NOT close it */
+    document.getElementById("panel-" + key).addEventListener("click", function(e) {
         e.stopPropagation();
     });
-    document.getElementById("search-" + key).addEventListener("input", (e) => {
+
+    /* Search */
+    document.getElementById("search-" + key).addEventListener("input", function(e) {
         filterList(key, e.target.value.toLowerCase());
+    });
+    document.getElementById("search-" + key).addEventListener("click", function(e) {
+        e.stopPropagation();
+    });
+}
+
+/* FIX 1 ── filterList was MISSING from the original code.
+   The search <input> called it, causing an immediate ReferenceError on
+   desktop that silently crashed the entire dropdown system.
+   On mobile the keyboard rarely appeared so the bug went unnoticed. */
+function filterList(key, query) {
+    document.querySelectorAll("#list-" + key + " .cs-item").forEach(function(item) {
+        var val = (item.dataset.value || "").toLowerCase();
+        item.style.display = val.includes(query) ? "" : "none";
     });
 }
 
 function closeAllPanels() {
-    document.querySelectorAll(".cs-panel.open").forEach(p => {
+    document.querySelectorAll(".cs-panel.open").forEach(function(p) {
         p.classList.remove("open");
-        var faceEl = document.getElementById("face-" + p.id.replace("panel-",""));
+        var faceEl = document.getElementById("face-" + p.id.replace("panel-", ""));
         if (faceEl) faceEl.classList.remove("open");
     });
     var bd = document.getElementById("mob-backdrop");
@@ -2404,31 +2442,54 @@ function closeAllPanels() {
 }
 
 function togglePanel(key) {
-    document.querySelectorAll(".cs-panel.open").forEach(p => {
+    var panel  = document.getElementById("panel-" + key);
+    var face   = document.getElementById("face-"  + key);
+    var isOpen = panel.classList.contains("open");
+
+    /* Close all OTHER open panels */
+    document.querySelectorAll(".cs-panel.open").forEach(function(p) {
         if (p.id !== "panel-" + key) {
             p.classList.remove("open");
-            var faceEl = document.getElementById("face-" + p.id.replace("panel-",""));
-            if (faceEl) faceEl.classList.remove("open");
+            var f = document.getElementById("face-" + p.id.replace("panel-", ""));
+            if (f) f.classList.remove("open");
         }
     });
-    const panel = document.getElementById("panel-" + key);
-    const face  = document.getElementById("face-"  + key);
-    panel.classList.toggle("open");
-    face.classList.toggle("open", panel.classList.contains("open"));
-    // Show/hide mobile backdrop
-    var bd = document.getElementById("mob-backdrop");
-    if (bd) bd.style.display = panel.classList.contains("open") ? "block" : "none";
-}
 
+    if (isOpen) {
+        panel.classList.remove("open");
+        face.classList.remove("open");
+        var bd = document.getElementById("mob-backdrop");
+        if (bd) bd.style.display = "none";
+    } else {
+        panel.classList.add("open");
+        face.classList.add("open");
+        var bd = document.getElementById("mob-backdrop");
+        if (bd) bd.style.display = "block";
+        /* Auto-focus search so user can type immediately */
+        var srch = document.getElementById("search-" + key);
+        if (srch) setTimeout(function() { srch.focus(); }, 30);
+    }
+}
 
 function updateFace(key) {
-    const face        = document.getElementById("face-" + key);
-    const placeholder = document.querySelector(`[data-key="${key}"]`).dataset.placeholder;
-    const sel         = selections[key];
-    face.textContent  = sel.size === 0 ? placeholder : sel.size === 1 ? [...sel][0] : sel.size + " selected";
+    var face        = document.getElementById("face-" + key);
+    var container   = document.querySelector('[data-key="' + key + '"]');
+    var placeholder = container ? (container.dataset.placeholder || "Select...") : "Select...";
+    var sel         = selections[key] || new Set();
+    face.textContent = sel.size === 0 ? placeholder
+                     : sel.size === 1 ? [...sel][0]
+                     : sel.size + " selected";
 }
 
-document.addEventListener("click", () => { closeAllPanels(); });
+/* FIX 2 ── document click handler now guards before closing.
+   Original: () => { closeAllPanels(); }  fired on EVERY click including
+   the face-button click, closing the panel the instant it opened on desktop.
+   Mobile was unaffected because the backdrop div intercepted the tap first.
+   Fix: check if the click was inside a panel or on a face — if so, ignore. */
+document.addEventListener("click", function(e) {
+    if (e.target.closest && (e.target.closest(".cs-panel") || e.target.closest(".cs-face"))) return;
+    closeAllPanels();
+});
 
 /* ====================================================
    API HELPERS
@@ -2945,20 +3006,7 @@ async function loadCurrentMonth() {
    ==================================================== */
 function resetKeys(keys) {
     keys.forEach(function(key) {
-        if (selections[key]) {
-            selections[key].clear();
-            var listEl = document.getElementById("list-" + key);
-            if (listEl) {
-                listEl.querySelectorAll(".cs-item").forEach(function(item) {
-                    item.classList.remove("checked");
-                    item.querySelector("input").checked = false;
-                    item.style.display = "";
-                });
-            }
-            var srch = document.getElementById("search-" + key);
-            if (srch) srch.value = "";
-            updateFace(key);
-        }
+        clearSelect(key);
     });
 }
 
@@ -3150,6 +3198,7 @@ function fillCustomSelect(key, list) {
     var listEl = document.getElementById("list-" + key);
     if (!listEl) return;
     if (!selections[key]) selections[key] = new Set();
+    _cachedOptions[key] = list.slice();   // cache full list so reset can restore it
     listEl.innerHTML = "";
     list.forEach(function(v) {
         var item = document.createElement("div");
