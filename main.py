@@ -1602,7 +1602,7 @@ body {
     display: none; position: absolute; top: calc(100% + 4px); left: 0;
     width: 100%; min-width: 200px; background: #fff; border: 1px solid #ccc;
     border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.15);
-    z-index: 9000; max-height: 280px; overflow: visible; flex-direction: column;
+    z-index: 9999; max-height: 280px; overflow: visible; flex-direction: column;
 }
 .cs-panel.open { display: flex; }
 .cs-search { padding: 8px 8px 4px; border-bottom: 1px solid #eee; flex-shrink: 0; }
@@ -2343,9 +2343,9 @@ tbody tr:hover { background: #f4f6ff; }
 /* ====================================================
    TAB SWITCHING
    ==================================================== */
-var compLoaded    = false;
-var divMonLoaded  = false;
-var dm26Loaded    = false;
+var compLoaded   = false;
+var divMonLoaded = false;
+var dm26Loaded   = false;
 
 function switchTab(pageId, btn) {
     closeAllPanels();
@@ -2362,25 +2362,22 @@ function switchTab(pageId, btn) {
 }
 
 /* ====================================================
-   CUSTOM MULTI-SELECT COMPONENT
-   Three bugs fixed vs original:
-   1. filterList() was never defined — caused crash on desktop search
-   2. document.addEventListener("click") closed panels immediately on desktop
-      (mobile was fine because the backdrop intercepted taps first)
-   3. Inline onclick="selectAllVisible('${key}')" had quote-escaping issues
-      inside Python triple-quoted strings — replaced with addEventListener
+   CUSTOM MULTI-SELECT — ALL 5 BUGS FIXED
+   Bug 1: filterList() was never defined
+   Bug 2: document click closed panel instantly on desktop
+   Bug 3: no click listener on row div — only tiny checkbox worked
+   Bug 4: overflow:hidden clipped clickable area
+   Bug 5: inline onclick="..." broke inside Python triple-quoted strings
    ==================================================== */
 const selections     = {};
-const _cachedOptions = {};   // full option list per key — used by reset
+const _cachedOptions = {};
 
 function buildCustomSelect(container) {
     var key         = container.dataset.key;
     var placeholder = container.dataset.placeholder || "Select...";
     selections[key] = new Set();
 
-    /* Build HTML without ANY inline onclick attributes.
-       Inline onclick inside a JS template literal inside a Python triple-quoted
-       string causes quote-escaping corruption. Use addEventListener instead. */
+    /* FIX 5: No inline onclick — use IDs + addEventListener instead */
     container.innerHTML =
         '<div class="cs-face" id="face-' + key + '">' + placeholder + '</div>' +
         '<div class="cs-panel" id="panel-' + key + '">' +
@@ -2392,7 +2389,7 @@ function buildCustomSelect(container) {
           '<div class="cs-list" id="list-' + key + '"></div>' +
         '</div>';
 
-    /* Wire Select All / Deselect All safely */
+    /* Wire Select All / Deselect All buttons */
     document.getElementById("sa-btn-" + key).addEventListener("click", function(e) {
         e.stopPropagation(); selectAllVisible(key);
     });
@@ -2400,18 +2397,19 @@ function buildCustomSelect(container) {
         e.stopPropagation(); clearSelect(key);
     });
 
-    /* Face: open/close, stop propagation so document handler does NOT fire */
+    /* Face button: open/close, stopPropagation prevents document handler */
     document.getElementById("face-" + key).addEventListener("click", function(e) {
         e.stopPropagation();
         togglePanel(key);
     });
 
-    /* Panel: stop propagation so document handler does NOT close it */
+    /* FIX 3+panel: stop propagation on panel BUT only on non-item clicks.
+       Items have their own stopPropagation so panel's handler won't interfere. */
     document.getElementById("panel-" + key).addEventListener("click", function(e) {
         e.stopPropagation();
     });
 
-    /* Search */
+    /* Search input */
     document.getElementById("search-" + key).addEventListener("input", function(e) {
         filterList(key, e.target.value.toLowerCase());
     });
@@ -2420,10 +2418,7 @@ function buildCustomSelect(container) {
     });
 }
 
-/* FIX 1 ── filterList was MISSING from the original code.
-   The search <input> called it, causing an immediate ReferenceError on
-   desktop that silently crashed the entire dropdown system.
-   On mobile the keyboard rarely appeared so the bug went unnoticed. */
+/* FIX 1: filterList was MISSING — caused silent JS crash on desktop search */
 function filterList(key, query) {
     document.querySelectorAll("#list-" + key + " .cs-item").forEach(function(item) {
         var val = (item.dataset.value || "").toLowerCase();
@@ -2446,7 +2441,7 @@ function togglePanel(key) {
     var face   = document.getElementById("face-"  + key);
     var isOpen = panel.classList.contains("open");
 
-    /* Close all OTHER open panels */
+    /* Close all other open panels first */
     document.querySelectorAll(".cs-panel.open").forEach(function(p) {
         if (p.id !== "panel-" + key) {
             p.classList.remove("open");
@@ -2465,7 +2460,7 @@ function togglePanel(key) {
         face.classList.add("open");
         var bd = document.getElementById("mob-backdrop");
         if (bd) bd.style.display = "block";
-        /* Auto-focus search so user can type immediately */
+        /* Auto-focus search on open */
         var srch = document.getElementById("search-" + key);
         if (srch) setTimeout(function() { srch.focus(); }, 30);
     }
@@ -2481,11 +2476,7 @@ function updateFace(key) {
                      : sel.size + " selected";
 }
 
-/* FIX 2 ── document click handler now guards before closing.
-   Original: () => { closeAllPanels(); }  fired on EVERY click including
-   the face-button click, closing the panel the instant it opened on desktop.
-   Mobile was unaffected because the backdrop div intercepted the tap first.
-   Fix: check if the click was inside a panel or on a face — if so, ignore. */
+/* FIX 2: Guard document click — don't close if click was inside panel or on face */
 document.addEventListener("click", function(e) {
     if (e.target.closest && (e.target.closest(".cs-panel") || e.target.closest(".cs-face"))) return;
     closeAllPanels();
@@ -3005,9 +2996,7 @@ async function loadCurrentMonth() {
    RESET FUNCTIONS
    ==================================================== */
 function resetKeys(keys) {
-    keys.forEach(function(key) {
-        clearSelect(key);
-    });
+    keys.forEach(function(key) { clearSelect(key); });
 }
 
 function resetPage1() {
@@ -3198,7 +3187,7 @@ function fillCustomSelect(key, list) {
     var listEl = document.getElementById("list-" + key);
     if (!listEl) return;
     if (!selections[key]) selections[key] = new Set();
-    _cachedOptions[key] = list.slice();   // cache full list so reset can restore it
+    _cachedOptions[key] = list.slice();  // cache for reset
     listEl.innerHTML = "";
     list.forEach(function(v) {
         var item = document.createElement("div");
@@ -3212,28 +3201,19 @@ function fillCustomSelect(key, list) {
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
 
-        /* Row click: toggle checkbox, stop propagation so panel stays open */
+        /* FIX 3: Row click toggles checkbox — works on desktop where
+           clicking label/row text would otherwise do nothing */
         item.addEventListener("click", function(e) {
             e.stopPropagation();
-            /* If user clicked directly on checkbox, browser already toggled it */
-            if (e.target !== chk) {
-                chk.checked = !chk.checked;
-            }
+            if (e.target !== chk) { chk.checked = !chk.checked; }
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
             if (isDivisionKey(key)) refreshDependentFilters(key);
         });
-
-        /* Checkbox change: also handle direct checkbox interaction */
         chk.addEventListener("change", function(e) {
             e.stopPropagation();
-            if (chk.checked) selections[key].add(v);
-            else             selections[key].delete(v);
-            item.classList.toggle("checked", chk.checked);
-            updateFace(key);
-            if (isDivisionKey(key)) refreshDependentFilters(key);
         });
 
         listEl.appendChild(item);
@@ -3269,25 +3249,17 @@ function fillDropdownOnly(key, list) {
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
 
-        /* Row click: toggle checkbox, stop propagation so panel stays open */
+        /* FIX 3: Row click toggles checkbox */
         item.addEventListener("click", function(e) {
             e.stopPropagation();
-            if (e.target !== chk) {
-                chk.checked = !chk.checked;
-            }
+            if (e.target !== chk) { chk.checked = !chk.checked; }
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
         });
-
-        /* Checkbox change: handle direct checkbox interaction */
         chk.addEventListener("change", function(e) {
             e.stopPropagation();
-            if (chk.checked) selections[key].add(v);
-            else             selections[key].delete(v);
-            item.classList.toggle("checked", chk.checked);
-            updateFace(key);
         });
 
         listEl.appendChild(item);
