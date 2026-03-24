@@ -1602,7 +1602,7 @@ body {
     display: none; position: absolute; top: calc(100% + 4px); left: 0;
     width: 100%; min-width: 200px; background: #fff; border: 1px solid #ccc;
     border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.15);
-    z-index: 999; max-height: 240px; overflow: hidden; flex-direction: column;
+    z-index: 9000; max-height: 280px; overflow: visible; flex-direction: column;
 }
 .cs-panel.open { display: flex; }
 .cs-search { padding: 8px 8px 4px; border-bottom: 1px solid #eee; flex-shrink: 0; }
@@ -1611,7 +1611,7 @@ body {
     border-radius: 4px; font-size: 12px; outline: none;
 }
 .cs-search input:focus { border-color: #4f6bdc; }
-.cs-list { overflow-y: auto; flex: 1; padding: 4px 0; }
+.cs-list { overflow-y: auto; flex: 1; padding: 4px 0; max-height: 180px; }
 .cs-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; color: #333; }
 .cs-item:hover { background: #f0f3ff; }
 .cs-item input[type=checkbox] { accent-color: #4f6bdc; cursor: pointer; }
@@ -3211,13 +3211,31 @@ function fillCustomSelect(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-        chk.addEventListener("change", function() {
+
+        /* Row click: toggle checkbox, stop propagation so panel stays open */
+        item.addEventListener("click", function(e) {
+            e.stopPropagation();
+            /* If user clicked directly on checkbox, browser already toggled it */
+            if (e.target !== chk) {
+                chk.checked = !chk.checked;
+            }
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
             if (isDivisionKey(key)) refreshDependentFilters(key);
         });
+
+        /* Checkbox change: also handle direct checkbox interaction */
+        chk.addEventListener("change", function(e) {
+            e.stopPropagation();
+            if (chk.checked) selections[key].add(v);
+            else             selections[key].delete(v);
+            item.classList.toggle("checked", chk.checked);
+            updateFace(key);
+            if (isDivisionKey(key)) refreshDependentFilters(key);
+        });
+
         listEl.appendChild(item);
     });
     updateFace(key);
@@ -3250,13 +3268,28 @@ function fillDropdownOnly(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-        // Attach change listener (no cascade for dependent keys)
-        chk.addEventListener("change", function() {
+
+        /* Row click: toggle checkbox, stop propagation so panel stays open */
+        item.addEventListener("click", function(e) {
+            e.stopPropagation();
+            if (e.target !== chk) {
+                chk.checked = !chk.checked;
+            }
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
         });
+
+        /* Checkbox change: handle direct checkbox interaction */
+        chk.addEventListener("change", function(e) {
+            e.stopPropagation();
+            if (chk.checked) selections[key].add(v);
+            else             selections[key].delete(v);
+            item.classList.toggle("checked", chk.checked);
+            updateFace(key);
+        });
+
         listEl.appendChild(item);
     });
     updateFace(key);
