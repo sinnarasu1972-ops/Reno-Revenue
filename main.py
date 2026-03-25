@@ -1,28 +1,13 @@
-from contextlib import asynccontextmanager
+# -*- coding: utf-8 -*-
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse, Response as FResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 import pandas as pd
-import numpy as np
+import uvicorn
+import threading
+import webbrowser
 import io
-import os
-import gc
-import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ── Env-based CSV paths (Render env vars or local defaults) ──
-CY24_PATH = os.getenv("CY24_PATH", "Invoice Report CY24.csv")
-CY25_PATH = os.getenv("CY25_PATH", "Invoice Report CY25.csv")
-CY26_PATH = os.getenv("CY26_PATH", "Invoice Report CY26.csv")
-GSHEET_CSV = os.getenv(
-    "GSHEET_CSV",
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv"
-)
-
-# ── Global DataFrames ──
-df            = pd.DataFrame()
-df_cancelled  = pd.DataFrame()
+app = FastAPI()
 
 # ---------------- HELPERS ----------------
 
@@ -44,6 +29,10 @@ def indian_format(n: float) -> str:
 
     return ("-" if negative else "") + result
 
+CY24_PATH = r"E:\Renault\Invoice Report CY24.csv"
+CY25_PATH = r"E:\Renault\Invoice Report CY25.csv"
+CY26_PATH = r"E:\Renault\Invoice Report CY26.csv"  # Jan & Feb only
+
 BRANCH_CODE_TO_NAME = {
     "AKJA": "AKOLA",
     "AUJA": "AURANGABAD",
@@ -64,97 +53,99 @@ BRANCH_CODE_TO_NAME = {
 
 ORIGINAL_CSV_COLS = []  # populated by load_data()
 
-# Only load columns we actually need — saves ~60% memory vs full load
-KEEP_COLS = [
-    "Repair Order#",
-    "RO Owner First Name",
-    "RO Owner Last Name",
-    "Vehicle Model",
-    "Vehicle Reg#",
-    "Invoice Date",
-    "Repair Order Date",
-    "Net Taxable Labor Amount",
-    "Net Taxable Parts Amt",
-    "Service Type",
-    "Invoice Type",
-    "Status",
-    "Invoice Status",
-    "RO Status",
-]
+LOAD_ERRORS = []   # populated if any CSV fails; shown on the dashboard
 
-def _read_lean(path: str, label: str) -> pd.DataFrame:
-    """Read only KEEP_COLS that exist in this file, dtype=str minimises peak RAM."""
+def _load_single_csv(path, cy_label):
+    """Load one CSV safely; returns empty DataFrame + logs error if file missing."""
+    import os
+    if not os.path.exists(path):
+        msg = f"⚠️  File NOT FOUND: {path}  (CY={cy_label})"
+        print(msg)
+        LOAD_ERRORS.append(msg)
+        return pd.DataFrame()
     try:
-        header = pd.read_csv(path, nrows=0)
-        header.columns = header.columns.str.strip()
-        use = [c for c in KEEP_COLS if c in header.columns]
-        tmp = pd.read_csv(path, usecols=use, dtype=str, low_memory=False)
-        tmp.columns = tmp.columns.str.strip()
-        tmp["CY"] = label
-        logger.info(f"Loaded {path}: {len(tmp)} rows, {len(tmp.columns)} cols")
-        return tmp
+        out = pd.read_csv(path, low_memory=False)
+        out["CY"] = cy_label
+        print(f"✅  Loaded {cy_label}: {len(out):,} rows  ←  {path}")
+        return out
     except Exception as e:
-        logger.error(f"Failed to load {path}: {e}")
+        msg = f"⚠️  Failed to read {path} ({cy_label}): {e}"
+        print(msg)
+        LOAD_ERRORS.append(msg)
         return pd.DataFrame()
 
 
 def load_data():
-    global ORIGINAL_CSV_COLS
+    df1 = _load_single_csv(CY24_PATH, "CY24")
+    df2 = _load_single_csv(CY25_PATH, "CY25")
+    df3 = _load_single_csv(CY26_PATH, "CY26")
 
-    frames = []
-    for path, label in [(CY24_PATH, "CY24"), (CY25_PATH, "CY25"), (CY26_PATH, "CY26")]:
-        if not os.path.exists(path):
-            logger.warning(f"Skipping missing file: {path}")
-            continue
-        tmp = _read_lean(path, label)
-        if not tmp.empty:
-            frames.append(tmp)
-        gc.collect()
-
+    frames = [f for f in [df1, df2, df3] if not f.empty]
     if not frames:
-        logger.error("No CSV files loaded!")
-        return pd.DataFrame(), pd.DataFrame()
+        # Nothing loaded at all — return empty DataFrames so server still starts
+        print("❌  No CSV files loaded. Server will start but show no data.")
+        empty = pd.DataFrame(columns=[
+            "CY","Division","SA Name","Model","Month","Invoice Date",
+            "Repair Order Date","Repair Order#","Vehicle Reg#",
+            "Service Type","Invoice Type","Vehicle Model",
+            "RO Owner First Name","RO Owner Last Name",
+            "Net Taxable Labor Amount","Net Taxable Parts Amt","TAT (Days)"
+        ])
+        return empty, empty.copy()
 
     df = pd.concat(frames, ignore_index=True)
-    del frames
-    gc.collect()
+    df.columns = df.columns.str.strip()
 
-    # Capture original CSV column order BEFORE adding computed cols
-    ORIGINAL_CSV_COLS = [c for c in df.columns if c != "CY"]
+    # ── Capture original CSV column order BEFORE adding computed cols ──
+    global ORIGINAL_CSV_COLS
+    ORIGINAL_CSV_COLS = list(df.columns)
 
-    # Division (branch code -> name)
-    _raw_div = df["Repair Order#"].astype(str).str[2:6]
-    df["Division"] = _raw_div.map(BRANCH_CODE_TO_NAME).fillna(_raw_div)
+    # ── Guard: required columns ──
+    required = ["Repair Order#", "RO Owner First Name", "RO Owner Last Name",
+                "Vehicle Model", "Invoice Date", "Repair Order Date",
+                "Net Taxable Labor Amount", "Net Taxable Parts Amt"]
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        msg = f"⚠️  Missing columns in CSV: {missing_cols}. Available: {list(df.columns[:20])}"
+        print(msg)
+        LOAD_ERRORS.append(msg)
 
-    # SA Name
-    first = df.get("RO Owner First Name", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
-    last  = df.get("RO Owner Last Name",  pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
-    df["SA Name"] = (first + " " + last).str.strip()
+    if "Repair Order#" in df.columns:
+        df["Division"] = df["Repair Order#"].astype(str).str[2:6].map(BRANCH_CODE_TO_NAME).fillna(
+            df["Repair Order#"].astype(str).str[2:6])
+    else:
+        df["Division"] = "Unknown"
 
-    # Model (first word, upper)
+    fn = df["RO Owner First Name"].astype(str) if "RO Owner First Name" in df.columns else pd.Series("", index=df.index)
+    ln = df["RO Owner Last Name"].astype(str)  if "RO Owner Last Name"  in df.columns else pd.Series("", index=df.index)
+    df["SA Name"] = fn + " " + ln
+
     if "Vehicle Model" in df.columns:
-        df["Model"] = df["Vehicle Model"].fillna("").astype(str).str.strip().str.split().str[0].str.upper()
+        df["Model"] = df["Vehicle Model"].astype(str).str.strip().str.split().str[0].str.upper()
+    else:
+        df["Model"] = "Unknown"
 
-    # Dates: DD-MM-YYYY or DD/MM/YYYY HH:MM:SS
+    # Format in CSV: "01-01-2025 10:06:00"  (DD-MM-YYYY HH:MM:SS)
     for date_col in ["Invoice Date", "Repair Order Date"]:
         if date_col not in df.columns:
+            df[date_col] = pd.NaT
             continue
-        raw = df[date_col].astype(str).str.strip().str[:10]
-        parsed = pd.to_datetime(raw, format="%d-%m-%Y", errors="coerce")
-        mask = parsed.isna()
+        raw_date = df[date_col].astype(str).str.strip().str[:10]
+        df[date_col] = pd.to_datetime(raw_date, format="%d-%m-%Y", errors="coerce")
+        mask = df[date_col].isna()
         if mask.any():
-            parsed[mask] = pd.to_datetime(raw[mask], format="%d/%m/%Y", errors="coerce")
-        df[date_col] = parsed
+            df.loc[mask, date_col] = pd.to_datetime(
+                raw_date[mask], format="%d/%m/%Y", errors="coerce"
+            )
 
-    # Month
-    if "Invoice Date" in df.columns:
-        df["Month"] = df["Invoice Date"].dt.strftime("%b")
+    df["Month"] = df["Invoice Date"].dt.strftime("%b") if "Invoice Date" in df.columns else "Jan"
 
-    # TAT (Int16 saves memory vs int64)
+    # TAT = Invoice Date - Repair Order Date (in days)
     if "Invoice Date" in df.columns and "Repair Order Date" in df.columns:
-        df["TAT (Days)"] = (df["Invoice Date"] - df["Repair Order Date"]).dt.days.astype("Int16")
+        df["TAT (Days)"] = (df["Invoice Date"] - df["Repair Order Date"]).dt.days
+    else:
+        df["TAT (Days)"] = 0
 
-    # Amounts as float32 (half the memory of float64)
     for col in ["Net Taxable Labor Amount", "Net Taxable Parts Amt"]:
         if col in df.columns:
             df[col] = (
@@ -163,74 +154,66 @@ def load_data():
                 .str.replace(",",   "", regex=False)
                 .pipe(pd.to_numeric, errors="coerce")
                 .fillna(0)
-                .astype(np.float32)
             )
         else:
-            df[col] = np.float32(0)
+            df[col] = 0.0
 
-    # Downcast low-cardinality string columns to category
-    for col in ["CY", "Division", "Service Type", "Invoice Type", "Model", "Month", "SA Name"]:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
+    # Split Cancelled vs Active
+    status_col = None
+    for c in df.columns:
+        if c.strip().lower() in ("status", "invoice status", "ro status"):
+            status_col = c
+            break
 
-    gc.collect()
-    logger.info(f"RAM after enrich: {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
-
-    # Status split
-    status_col = next(
-        (c for c in df.columns if c.strip().lower() in ("status", "invoice status", "ro status")),
-        None
-    )
     if status_col:
         cancelled_mask = df[status_col].astype(str).str.strip().str.lower() == "cancelled"
-        logger.info(f"Status col: '{status_col}' | Cancelled: {cancelled_mask.sum()}")
     else:
         cancelled_mask = pd.Series(False, index=df.index)
-        logger.warning("No status column found — treating all rows as active")
 
     df_cancelled = df[cancelled_mask].copy()
     df_active    = df[~cancelled_mask].copy()
-    del df
-    gc.collect()
 
-    logger.info(f"Active: {len(df_active)} | Cancelled: {len(df_cancelled)}")
-    logger.info(f"Final RAM: {df_active.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    print(f"✅  Active rows: {len(df_active):,}  |  Cancelled rows: {len(df_cancelled):,}")
     return df_active, df_cancelled
 
 
-# ── Lifespan: load data on startup ──
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global df, df_cancelled
-    logger.info("Startup — loading CSV data...")
-    df, df_cancelled = load_data()
-    logger.info(f"Loaded: active={len(df)}, cancelled={len(df_cancelled)}")
-    yield
-    logger.info("Shutdown.")
+df, df_cancelled = load_data()
 
 
+# ---------------- DEBUG ENDPOINT ----------------
 
-# ── App with lifespan ──
-app = FastAPI(title="Renault Revenue", version="15.0", lifespan=lifespan)
+@app.get("/debug")
+def debug():
+    """Visit /debug in browser to see file paths, row counts, and any load errors."""
+    import os
+    return {
+        "paths": {
+            "CY24": CY24_PATH, "CY24_exists": os.path.exists(CY24_PATH),
+            "CY25": CY25_PATH, "CY25_exists": os.path.exists(CY25_PATH),
+            "CY26": CY26_PATH, "CY26_exists": os.path.exists(CY26_PATH),
+        },
+        "row_counts": {
+            "active":    len(df),
+            "cancelled": len(df_cancelled),
+            "CY24_rows": int((df["CY"] == "CY24").sum()) if "CY" in df.columns else 0,
+            "CY25_rows": int((df["CY"] == "CY25").sum()) if "CY" in df.columns else 0,
+            "CY26_rows": int((df["CY"] == "CY26").sum()) if "CY" in df.columns else 0,
+        },
+        "columns": list(df.columns) if not df.empty else [],
+        "load_errors": LOAD_ERRORS,
+    }
 
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Health endpoint ──
-@app.get("/health")
-def health():
-    return {"status": "ok", "active_rows": len(df), "cancelled_rows": len(df_cancelled)}
 
 # ---------------- FILTERS ----------------
 
 @app.get("/filters")
 def filters():
+    MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    # Detect which CYs actually have data, sorted by year number
+    all_cys = sorted(
+        df["CY"].dropna().unique().tolist(),
+        key=lambda c: int(c.replace("CY","")) if c.startswith("CY") else 9999
+    )
     return {
         "division": sorted(df["Division"].dropna().unique().tolist()),
         "service":  sorted(df["Service Type"].dropna().unique().tolist()),
@@ -239,11 +222,9 @@ def filters():
         "model":    sorted(df["Model"].dropna().unique().tolist()),
         "month":    sorted(
             df["Month"].dropna().unique().tolist(),
-            key=lambda m: ["Jan","Feb","Mar","Apr","May","Jun",
-                           "Jul","Aug","Sep","Oct","Nov","Dec"].index(m)
-            if m in ["Jan","Feb","Mar","Apr","May","Jun",
-                     "Jul","Aug","Sep","Oct","Nov","Dec"] else 99
+            key=lambda m: MONTHS.index(m) if m in MONTHS else 99
         ),
+        "cy_years": all_cys,   # e.g. ["CY24","CY25","CY26"] — only years with data
     }
 
 
@@ -846,6 +827,155 @@ def comparison(
     return result
 
 
+# ---------------- COMPARISON FLEX (any two CYs) ----------------
+
+@app.get("/comparison-flex")
+def comparison_flex(
+    cy_a:     str = "CY24",
+    cy_b:     str = "CY25",
+    division: list[str] = Query(None),
+    service:  list[str] = Query(None),
+    sa:       list[str] = Query(None),
+    invoice:  list[str] = Query(None),
+    model:    list[str] = Query(None),
+):
+    """
+    Generic month-by-month comparison between any two calendar years (cy_a vs cy_b).
+    Months shown = all months that have data in cy_b (so if cy_b is incomplete, only
+    those months appear).  Supports CY24/CY25/CY26 and future CY27/CY28+ automatically.
+    """
+    MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    def apply_filters(data):
+        if division: data = data[data["Division"].isin(division)]
+        if service:  data = data[data["Service Type"].isin(service)]
+        if sa:       data = data[data["SA Name"].isin(sa)]
+        if invoice:  data = data[data["Invoice Type"].isin(invoice)]
+        if model:    data = data[data["Model"].isin(model)]
+        return data
+
+    base_a = apply_filters(df[df["CY"] == cy_a])
+    base_b = apply_filters(df[df["CY"] == cy_b])
+
+    # Months to display = months present in cy_b (handles partial year like CY26 Jan-Feb only)
+    months_in_b = sorted(
+        base_b["Month"].dropna().unique().tolist(),
+        key=lambda m: MONTHS.index(m) if m in MONTHS else 99
+    )
+    # If cy_b has no data (e.g. CY27 not yet loaded), return empty immediately
+    if not months_in_b:
+        return {"cy_a": cy_a, "cy_b": cy_b, "rows": []}
+
+    result = []
+    for month in months_in_b:
+        da = base_a[base_a["Month"] == month]
+        db = base_b[base_b["Month"] == month]
+
+        inflow_a = int(da["Repair Order#"].nunique())
+        inflow_b = int(db["Repair Order#"].nunique())
+        labour_a = float(da["Net Taxable Labor Amount"].sum())
+        labour_b = float(db["Net Taxable Labor Amount"].sum())
+        spares_a = float(da["Net Taxable Parts Amt"].sum())
+        spares_b = float(db["Net Taxable Parts Amt"].sum())
+
+        def pct(new, old):
+            if old == 0: return None
+            return round((new - old) / old * 100, 2)
+
+        if inflow_a == 0 and inflow_b == 0:
+            continue
+
+        result.append({
+            "month":    month,
+            "inflow_a": inflow_a,  "inflow_b": inflow_b,  "inflow_pct": pct(inflow_b, inflow_a),
+            "labour_a": labour_a,  "labour_b": labour_b,  "labour_pct": pct(labour_b, labour_a),
+            "spares_a": spares_a,  "spares_b": spares_b,  "spares_pct": pct(spares_b, spares_a),
+            "total_a":  labour_a + spares_a,
+            "total_b":  labour_b + spares_b,
+            "total_pct": pct(labour_b + spares_b, labour_a + spares_a),
+        })
+
+    return {"cy_a": cy_a, "cy_b": cy_b, "rows": result}
+
+
+# ---------------- EXPORT — COMPARISON FLEX ----------------
+
+@app.get("/export-comparison-flex")
+def export_comparison_flex(
+    cy_a:     str = "CY24",
+    cy_b:     str = "CY25",
+    division: list[str] = Query(None),
+    service:  list[str] = Query(None),
+    sa:       list[str] = Query(None),
+    invoice:  list[str] = Query(None),
+    model:    list[str] = Query(None),
+):
+    MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    def _f(data):
+        if division: data = data[data["Division"].isin(division)]
+        if service:  data = data[data["Service Type"].isin(service)]
+        if sa:       data = data[data["SA Name"].isin(sa)]
+        if invoice:  data = data[data["Invoice Type"].isin(invoice)]
+        if model:    data = data[data["Model"].isin(model)]
+        return data
+
+    base_a = _f(df[df["CY"] == cy_a])
+    base_b = _f(df[df["CY"] == cy_b])
+    canc   = _f(df_cancelled.copy())
+
+    months_in_b = sorted(
+        base_b["Month"].dropna().unique().tolist(),
+        key=lambda m: MONTHS.index(m) if m in MONTHS else 99
+    )
+    if not months_in_b:
+        months_in_b = []  # cy_b has no data yet
+
+    rows = []
+    for month in months_in_b:
+        da = base_a[base_a["Month"] == month]
+        db = base_b[base_b["Month"] == month]
+        if da["Repair Order#"].nunique() == 0 and db["Repair Order#"].nunique() == 0:
+            continue
+        def pct(n, o): return round((n - o) / o * 100, 2) if o else None
+        rows.append({
+            "Month":               month,
+            f"Inflow {cy_a}":      int(da["Repair Order#"].nunique()),
+            f"Inflow {cy_b}":      int(db["Repair Order#"].nunique()),
+            "Inflow Growth%":      pct(db["Repair Order#"].nunique(), da["Repair Order#"].nunique()),
+            f"Labour {cy_a}":      round(float(da["Net Taxable Labor Amount"].sum()), 2),
+            f"Labour {cy_b}":      round(float(db["Net Taxable Labor Amount"].sum()), 2),
+            "Labour Growth%":      pct(db["Net Taxable Labor Amount"].sum(), da["Net Taxable Labor Amount"].sum()),
+            f"Spares {cy_a}":      round(float(da["Net Taxable Parts Amt"].sum()), 2),
+            f"Spares {cy_b}":      round(float(db["Net Taxable Parts Amt"].sum()), 2),
+            "Spares Growth%":      pct(db["Net Taxable Parts Amt"].sum(), da["Net Taxable Parts Amt"].sum()),
+            f"Total {cy_a}":       round(float(da["Net Taxable Labor Amount"].sum() + da["Net Taxable Parts Amt"].sum()), 2),
+            f"Total {cy_b}":       round(float(db["Net Taxable Labor Amount"].sum() + db["Net Taxable Parts Amt"].sum()), 2),
+            "Total Growth%":       pct(
+                db["Net Taxable Labor Amount"].sum() + db["Net Taxable Parts Amt"].sum(),
+                da["Net Taxable Labor Amount"].sum() + da["Net Taxable Parts Amt"].sum()
+            ),
+        })
+
+    inv_data = df.copy()
+    inv_canc = df_cancelled.copy()
+    if division: inv_data = inv_data[inv_data["Division"].isin(division)]; inv_canc = inv_canc[inv_canc["Division"].isin(division)]
+    if service:  inv_data = inv_data[inv_data["Service Type"].isin(service)]; inv_canc = inv_canc[inv_canc["Service Type"].isin(service)]
+    if sa:       inv_data = inv_data[inv_data["SA Name"].isin(sa)]; inv_canc = inv_canc[inv_canc["SA Name"].isin(sa)]
+    if invoice:  inv_data = inv_data[inv_data["Invoice Type"].isin(invoice)]; inv_canc = inv_canc[inv_canc["Invoice Type"].isin(invoice)]
+    if model:    inv_data = inv_data[inv_data["Model"].isin(model)]; inv_canc = inv_canc[inv_canc["Model"].isin(model)]
+
+    sheet_name = f"{cy_a} vs {cy_b}"[:31]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name=sheet_name)
+        _style_sheet(writer.sheets[sheet_name], highlight_last_n=0)
+        _write_invoice_data_sheet(writer, inv_data)
+        _write_cancelled_sheet(writer, inv_canc)
+
+    return _stream_excel(output, f"Renault_{cy_a}_vs_{cy_b}_Comparison.xlsx")
+
+
 # ---------------- DIVISION-MONTH ----------------
 
 @app.get("/division-month")
@@ -1325,15 +1455,18 @@ async function _loadCurrentMonth() {
         console.error("_loadCurrentMonth failed:", e2);
     }
 }
-""".replace("__GSHEET_URL__", GSHEET_CSV)
+""".replace("__GSHEET_URL__", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv")
+
+from fastapi.responses import Response as FResponse
 
 @app.get("/cm.js")
 def cm_js():
-    return FResponse(content=CM_JS, media_type="application/javascript")
+    return FResponse(content=CM_JS.encode("utf-8"), media_type="application/javascript; charset=utf-8")
 
 # ---------------- CURRENT MONTH (Google Sheet) ----------------
 
-# GSHEET_CSV is defined at top via env var
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pubhtml"
+GSHEET_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv"
 
 @app.get("/current-month")
 def current_month(
@@ -1498,13 +1631,12 @@ def current_month(
     }
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=Response)
 def dashboard():
-    return HTMLResponse("""<!DOCTYPE html>
+    html_content = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Renault Service Revenue Dashboard v6</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1529,16 +1661,7 @@ body {
 .header h2 { font-size: 22px; color: #222; }
 
 /* ---------- TABS ---------- */
-.tabs-wrap { position: relative; margin-bottom: 24px; }
-.tabs { display: flex; gap: 4px; border-bottom: 2px solid #e5e7eb; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
-.tabs::-webkit-scrollbar { display: none; }
-.tab-scroll-hint {
-  display: none;
-  position: absolute; right: 0; top: 0; bottom: 2px;
-  width: 32px; background: linear-gradient(to right, transparent, #fff 60%);
-  align-items: center; justify-content: flex-end; padding-right: 4px;
-  font-size: 20px; color: #4f6bdc; pointer-events: none;
-}
+.tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 2px solid #e5e7eb; }
 .tab-btn {
     padding: 10px 24px;
     border: none;
@@ -1586,6 +1709,12 @@ body {
     appearance: auto; height: 34px;
 }
 .fg select#cy:focus { outline: 2px solid #4f6bdc; border-color: transparent; }
+.fg select#cmp-cy-a, .fg select#cmp-cy-b {
+    width: 100%; padding: 7px 10px; border: 1px solid #ccc; border-radius: 6px;
+    font-size: 13px; background: #fff; cursor: pointer; color: #333;
+    appearance: auto; height: 34px;
+}
+.fg select#cmp-cy-a:focus, .fg select#cmp-cy-b:focus { outline: 2px solid #4f6bdc; border-color: transparent; }
 
 /* ---------- CUSTOM MULTI-SELECT ---------- */
 .custom-select { position: relative; width: 100%; }
@@ -1602,7 +1731,7 @@ body {
     display: none; position: absolute; top: calc(100% + 4px); left: 0;
     width: 100%; min-width: 200px; background: #fff; border: 1px solid #ccc;
     border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.15);
-    z-index: 9999; max-height: 280px; overflow: visible; flex-direction: column;
+    z-index: 999; max-height: 240px; overflow: hidden; flex-direction: column;
 }
 .cs-panel.open { display: flex; }
 .cs-search { padding: 8px 8px 4px; border-bottom: 1px solid #eee; flex-shrink: 0; }
@@ -1611,7 +1740,7 @@ body {
     border-radius: 4px; font-size: 12px; outline: none;
 }
 .cs-search input:focus { border-color: #4f6bdc; }
-.cs-list { overflow-y: auto; flex: 1; padding: 4px 0; max-height: 180px; }
+.cs-list { overflow-y: auto; flex: 1; padding: 4px 0; }
 .cs-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; color: #333; }
 .cs-item:hover { background: #f0f3ff; }
 .cs-item input[type=checkbox] { accent-color: #4f6bdc; cursor: pointer; }
@@ -1790,219 +1919,36 @@ tbody tr:hover { background: #f4f6ff; }
   0%, 100% { opacity: 1; transform: scale(1); }
   50%       { opacity: .4; transform: scale(1.3); }
 }
-
-/* ============================================================
-   RESPONSIVE — Mobile / Tablet / Laptop / Desktop
-   Breakpoints:
-     xs  mobile portrait  : < 480px
-     sm  mobile landscape : 480–767px
-     md  tablet           : 768–1023px
-     lg  laptop           : 1024–1279px
-     xl  desktop          : 1280px+
-   ============================================================ */
-
-/* ── Base: body padding shrinks on small screens ── */
-@media (max-width: 767px) {
-  body { padding: 0; background: #f0f2ff; }
-  .container { border-radius: 0; padding: 14px 12px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  body { padding: 12px; }
-  .container { padding: 20px 18px; }
-}
-
-/* ── HEADER ── */
-@media (max-width: 767px) {
-  .header { flex-direction: column; align-items: flex-start; gap: 6px; margin-bottom: 14px; }
-  .header h2 { font-size: 17px; line-height: 1.3; }
-}
-
-/* ── TABS — horizontal scroll on small screens ── */
-@media (max-width: 767px) {
-  .tabs {
-    flex-wrap: nowrap;
-    gap: 0;
-    margin-bottom: 0;
-  }
-  .tabs-wrap { margin-bottom: 16px; }
-  .tab-scroll-hint { display: flex; }
-  .tab-btn {
-    padding: 9px 14px;
-    font-size: 12px;
-    white-space: nowrap;
-    flex-shrink: 0;
-    border-radius: 0;
-  }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .tabs { flex-wrap: wrap; gap: 2px; }
-  .tab-btn { padding: 8px 14px; font-size: 13px; }
-}
-
-/* ── CARDS ── */
-@media (max-width: 479px) {
-  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .card { padding: 12px 10px; }
-  .card .value { font-size: 16px; }
-  .card .label { font-size: 10px; margin-bottom: 5px; }
-}
-@media (min-width: 480px) and (max-width: 767px) {
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .card { padding: 12px 10px; }
-  .card .value { font-size: 15px; }
-  .card .label { font-size: 10px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .card .value { font-size: 18px; }
-}
-
-/* ── FILTER BAR ── */
-@media (max-width: 479px) {
-  .filter-bar { padding: 12px 10px; gap: 10px; }
-  .fg { min-width: calc(50% - 5px); flex: none; }
-  .fg label { font-size: 10px; }
-  .fg select#cy { font-size: 12px; height: 32px; }
-  .cs-face { font-size: 12px; height: 32px; }
-  .apply-btn, .export-btn, .reset-btn {
-    height: 32px; font-size: 12px;
-    padding: 0 12px; flex: 1;
-  }
-}
-@media (min-width: 480px) and (max-width: 767px) {
-  .filter-bar { padding: 12px; gap: 10px; }
-  .fg { min-width: calc(50% - 5px); flex: none; }
-  .apply-btn, .export-btn, .reset-btn { height: 32px; font-size: 13px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .fg { min-width: 140px; }
-}
-
-/* Buttons row on mobile — full width row */
-@media (max-width: 479px) {
-  .filter-bar .apply-btn,
-  .filter-bar .export-btn,
-  .filter-bar .reset-btn {
-    width: 100%;
-    flex: 1 1 calc(33% - 8px);
-    min-width: 80px;
-  }
-}
-
-/* ── TABLES — horizontal scroll + smaller text ── */
-@media (max-width: 767px) {
-  .table-wrap, .op-wrap, .pivot-wrap { border-radius: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table, .comp-table, .pivot-table, .op-table { font-size: 11px; min-width: 540px; }
-  th, td { padding: 7px 8px; }
-  .comp-table th, .comp-table td { padding: 7px 8px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  table, .comp-table, .pivot-table, .op-table { font-size: 12px; }
-  th, td { padding: 8px 10px; }
-}
-
-/* ── COMPARISON SECTION HEADINGS ── */
-@media (max-width: 767px) {
-  .comp-section h3 { font-size: 13px; }
-  .pivot-section h3 { font-size: 13px; }
-}
-
-/* ── PCT BADGES — smaller on mobile ── */
-@media (max-width: 767px) {
-  .pct, .pct-up, .pct-down, .pct-flat { font-size: 10px; padding: 1px 5px; }
-}
-
-/* ── ONE PAGER TABLE ── */
-@media (max-width: 767px) {
-  .op-table th.desc-hdr { min-width: 140px; }
-  .op-table th.div-hdr  { min-width: 60px; }
-  .op-table th, .op-table td { padding: 6px 8px; font-size: 10px; }
-}
-
-/* ── CURRENT MONTH cards stack on mobile ── */
-@media (max-width: 479px) {
-  #page5 .cards { grid-template-columns: 1fr 1fr; }
-}
-@media (min-width: 480px) and (max-width: 767px) {
-  #page5 .cards { grid-template-columns: repeat(3, 1fr); }
-}
-
-/* ── LIVE BADGE row wraps ── */
-@media (max-width: 479px) {
-  #page5 > div[style*="display:flex"] {
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-}
-
-/* ── Division summary table on Page 5 — very wide, always scroll ── */
-@media (max-width: 1279px) {
-  #cm-div-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  #cm-div-wrap table { min-width: 900px; }
-}
-@media (max-width: 767px) {
-  #cm-div-wrap table { font-size: 10px; }
-  #cm-div-wrap th, #cm-div-wrap td { padding: 5px 6px; }
-  #cm-mtd-wrap table { min-width: 320px; font-size: 11px; }
-}
-
-/* ── Container max-width steps ── */
-@media (min-width: 1280px)  { .container { max-width: 1400px; } }
-@media (min-width: 1024px) and (max-width: 1279px) { .container { max-width: 1200px; } }
-@media (min-width: 768px)  and (max-width: 1023px) { .container { max-width: 960px;  } }
-
-/* ── Sticky first-column on pivot/op tables ── */
-@media (max-width: 767px) {
-  .pivot-table td:first-child,
-  .op-table td.desc-cell { min-width: 90px; font-size: 10px; }
-}
-
-/* ── Touch-friendly tap targets ── */
-@media (hover: none) and (pointer: coarse) {
-  .tab-btn   { min-height: 42px; }
-  .cs-item   { min-height: 38px; padding: 8px 12px; }
-  .cs-sa-btn { min-height: 34px; }
-  .apply-btn, .export-btn, .reset-btn { min-height: 38px; }
-}
-
-/* ── cs-panel: fix dropdown going off-screen on mobile ── */
-@media (max-width: 767px) {
-  .cs-panel {
-    position: fixed;
-    left: 8px !important;
-    right: 8px !important;
-    width: auto !important;
-    top: auto !important;
-    bottom: 0;
-    border-radius: 12px 12px 0 0;
-    max-height: 60vh;
-    box-shadow: 0 -4px 24px rgba(0,0,0,.18);
-    z-index: 9999;
-  }
-}
-
 </style>
 </head>
 
 <body>
 <div class="container">
 
-  <!-- HEADER -->
+  <!-- LOAD ERROR BANNER (shown only if CSV files had problems) -->
+  <div id="load-error-banner" style="display:none;background:#fee2e2;border:2px solid #dc2626;
+       border-radius:10px;padding:16px 20px;margin-bottom:20px;color:#7f1d1d;">
+    <div style="font-weight:700;font-size:15px;margin-bottom:8px;">⚠️ Data Load Warning</div>
+    <div id="load-error-text" style="font-size:13px;line-height:1.6;"></div>
+    <div style="margin-top:10px;font-size:12px;color:#991b1b;">
+      Check your CSV file paths in the Python script, then restart the server.
+      Visit <a href="/debug" target="_blank" style="color:#dc2626;font-weight:700;">/debug</a>
+      for full diagnostics.
+    </div>
+  </div>
   <div class="header">
     <h2>Renault Service Revenue Dashboard</h2>
   </div>
 
   <!-- TABS -->
-  <div class="tabs-wrap">
-    <div class="tabs" id="tabsEl">
-      <button class="tab-btn active" onclick="switchTab('page1', this)">Invoice Data</button>
-      <button class="tab-btn"        onclick="switchTab('page2', this)">CY Comparison</button>
-      <button class="tab-btn"        onclick="switchTab('page3', this)">Division-Month</button>
-      <button class="tab-btn"        onclick="switchTab('page4', this)">One Pager Report</button>
-      <button class="tab-btn"        onclick="switchTab('page5', this)">Current Month (Mar)</button>
-      <button class="tab-btn"        onclick="switchTab('page6', this)">Division-Month CY26</button>
-    </div>
-    <div class="tab-scroll-hint" id="tabScrollHint">&#8250;</div>
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('page1', this)">Invoice Data</button>
+    <button class="tab-btn"        onclick="switchTab('page2', this)">CY Comparison</button>
+    <button class="tab-btn"        onclick="switchTab('page3', this)">Division-Month</button>
+    <button class="tab-btn"        onclick="switchTab('page4', this)">One Pager Report</button>
+    <button class="tab-btn"        onclick="switchTab('page5', this)">Current Month (Mar)</button>
+    <button class="tab-btn"        onclick="switchTab('page6', this)">Division-Month CY26</button>
+    <button class="tab-btn"        onclick="switchTab('page7', this)">Comparison</button>
   </div>
 
   <!-- ==================== PAGE 1 ==================== -->
@@ -2024,9 +1970,6 @@ tbody tr:hover { background: #f4f6ff; }
         <label>Calendar Year</label>
         <select id="cy">
           <option value="">All CY</option>
-          <option value="CY24">CY24</option>
-          <option value="CY25">CY25</option>
-          <option value="CY26">CY26</option>
         </select>
       </div>
       <div class="fg"><label>Division</label>
@@ -2152,9 +2095,6 @@ tbody tr:hover { background: #f4f6ff; }
         <label>Calendar Year</label>
         <select id="op-cy">
           <option value="">All CY</option>
-          <option value="CY24">CY24</option>
-          <option value="CY25">CY25</option>
-          <option value="CY26">CY26</option>
         </select>
       </div>
       <div class="fg"><label>Division</label>
@@ -2334,152 +2274,142 @@ tbody tr:hover { background: #f4f6ff; }
 
   </div><!-- /page6 -->
 
-</div><!-- /container -->
+  <!-- ==================== PAGE 7 — COMPARISON (Any Two CYs) ==================== -->
+  <div id="page7" class="tab-page">
 
-<!-- Mobile dropdown backdrop -->
-<div id="mob-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9998;" onclick="closeAllPanels()"></div>
+    <div class="filter-bar">
+      <!-- CY A selector -->
+      <div class="fg" style="max-width:140px;">
+        <label>Compare</label>
+        <select id="cmp-cy-a" onchange="onCmpCyChange()">
+          <option value="">Loading...</option>
+        </select>
+      </div>
+      <div class="fg" style="max-width:30px;align-items:center;padding-top:18px;">
+        <span style="font-weight:700;color:#4f6bdc;font-size:16px;">vs</span>
+      </div>
+      <!-- CY B selector -->
+      <div class="fg" style="max-width:140px;">
+        <label>&nbsp;</label>
+        <select id="cmp-cy-b" onchange="onCmpCyChange()">
+          <option value="">Loading...</option>
+        </select>
+      </div>
+      <div class="fg"><label>Division</label>
+        <div class="custom-select" id="cs7-division" data-key="cmp-division" data-placeholder="All Divisions"></div>
+      </div>
+      <div class="fg"><label>Service Type</label>
+        <div class="custom-select" id="cs7-service" data-key="cmp-service" data-placeholder="All Service Types"></div>
+      </div>
+      <div class="fg"><label>SA Name</label>
+        <div class="custom-select" id="cs7-sa" data-key="cmp-sa" data-placeholder="All SAs"></div>
+      </div>
+      <div class="fg"><label>Invoice Type</label>
+        <div class="custom-select" id="cs7-invoice" data-key="cmp-invoice" data-placeholder="All Invoice Types"></div>
+      </div>
+      <div class="fg"><label>Model</label>
+        <div class="custom-select" id="cs7-model" data-key="cmp-model" data-placeholder="All Models"></div>
+      </div>
+      <button class="apply-btn"  onclick="applyFlexComparison()">Apply</button>
+      <button class="export-btn" id="export-btn-p7" onclick="exportPage7()">Export Excel</button>
+      <button class="reset-btn"  onclick="resetPage7()">Reset</button>
+    </div>
+
+    <!-- Info banner -->
+    <div id="cmp-info-banner" style="
+        background:#eef1ff;border:1px solid #c7d2fe;border-radius:8px;
+        padding:10px 16px;margin-bottom:16px;font-size:13px;color:#3730a3;
+        display:flex;align-items:center;gap:8px;">
+      <span style="font-size:16px;">ℹ️</span>
+      <span id="cmp-info-text">Select two calendar years above and click Apply to compare.</span>
+    </div>
+
+    <div id="cmp-content">
+      <div class="comp-loading">Select a year pair and click Apply to load comparison data…</div>
+    </div>
+
+  </div><!-- /page7 -->
+
+</div><!-- /container -->
 
 <script>
 /* ====================================================
    TAB SWITCHING
    ==================================================== */
-var compLoaded   = false;
-var divMonLoaded = false;
-var dm26Loaded   = false;
+let compLoaded    = false;
+let divMonLoaded  = false;
+let dm26Loaded    = false;
+let opLoaded      = false;
+let compFlexLoaded = false;
 
 function switchTab(pageId, btn) {
-    closeAllPanels();
-    document.querySelectorAll(".tab-page").forEach(function(p) { p.classList.remove("active"); });
-    document.querySelectorAll(".tab-btn").forEach(function(b) { b.classList.remove("active"); });
+    document.querySelectorAll(".tab-page").forEach(p => p.classList.remove("active"));
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
     document.getElementById(pageId).classList.add("active");
     btn.classList.add("active");
-    btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
     if (pageId === "page2" && !compLoaded)   { loadComparison(); compLoaded = true; }
     if (pageId === "page3" && !divMonLoaded) { loadDivMonth(); divMonLoaded = true; }
     if (pageId === "page4") { loadOnePager(); }
     if (pageId === "page5") { loadCurrentMonth(); }
     if (pageId === "page6" && !dm26Loaded) { loadDivMonth26(); dm26Loaded = true; }
+    if (pageId === "page7" && !compFlexLoaded) { updateCmpInfoBanner(); compFlexLoaded = true; }
 }
 
 /* ====================================================
-   CUSTOM MULTI-SELECT — ALL 5 BUGS FIXED
-   Bug 1: filterList() was never defined
-   Bug 2: document click closed panel instantly on desktop
-   Bug 3: no click listener on row div — only tiny checkbox worked
-   Bug 4: overflow:hidden clipped clickable area
-   Bug 5: inline onclick="..." broke inside Python triple-quoted strings
+   CUSTOM MULTI-SELECT COMPONENT
    ==================================================== */
-const selections     = {};
-const _cachedOptions = {};
+const selections = {};
 
 function buildCustomSelect(container) {
-    var key         = container.dataset.key;
-    var placeholder = container.dataset.placeholder || "Select...";
-    selections[key] = new Set();
+    const key         = container.dataset.key;
+    const placeholder = container.dataset.placeholder || "Select…";
+    selections[key]   = new Set();
 
-    /* FIX 5: No inline onclick — use IDs + addEventListener instead */
-    container.innerHTML =
-        '<div class="cs-face" id="face-' + key + '">' + placeholder + '</div>' +
-        '<div class="cs-panel" id="panel-' + key + '">' +
-          '<div class="cs-search"><input type="text" placeholder="Search..." id="search-' + key + '" autocomplete="off"></div>' +
-          '<div class="cs-sel-all">' +
-            '<button class="cs-sa-btn" type="button" id="sa-btn-' + key + '">\u2714 Select All</button>' +
-            '<button class="cs-sa-btn" type="button" id="cl-btn-' + key + '">\u2716 Deselect All</button>' +
-          '</div>' +
-          '<div class="cs-list" id="list-' + key + '"></div>' +
-        '</div>';
+    container.innerHTML = `
+      <div class="cs-face" id="face-${key}">${placeholder}</div>
+      <div class="cs-panel" id="panel-${key}">
+        <div class="cs-search"><input type="text" placeholder="Search…" id="search-${key}"></div>
+        <div class="cs-sel-all">
+          <button class="cs-sa-btn" onclick="selectAllVisible('${key}')">✔ Select All</button>
+          <button class="cs-sa-btn" onclick="clearSelect('${key}')">✖ Deselect All</button>
+        </div>
+        <div class="cs-list"  id="list-${key}"></div>
+      </div>`;
 
-    /* Wire Select All / Deselect All buttons */
-    document.getElementById("sa-btn-" + key).addEventListener("click", function(e) {
-        e.stopPropagation(); selectAllVisible(key);
+    document.getElementById("face-" + key).addEventListener("click", (e) => {
+        e.stopPropagation(); togglePanel(key);
     });
-    document.getElementById("cl-btn-" + key).addEventListener("click", function(e) {
-        e.stopPropagation(); clearSelect(key);
-    });
-
-    /* Face button: open/close, stopPropagation prevents document handler */
-    document.getElementById("face-" + key).addEventListener("click", function(e) {
-        e.stopPropagation();
-        togglePanel(key);
-    });
-
-    /* FIX 3+panel: stop propagation on panel BUT only on non-item clicks.
-       Items have their own stopPropagation so panel's handler won't interfere. */
-    document.getElementById("panel-" + key).addEventListener("click", function(e) {
-        e.stopPropagation();
-    });
-
-    /* Search input */
-    document.getElementById("search-" + key).addEventListener("input", function(e) {
+    document.getElementById("search-" + key).addEventListener("input", (e) => {
         filterList(key, e.target.value.toLowerCase());
     });
-    document.getElementById("search-" + key).addEventListener("click", function(e) {
-        e.stopPropagation();
-    });
-}
-
-/* FIX 1: filterList was MISSING — caused silent JS crash on desktop search */
-function filterList(key, query) {
-    document.querySelectorAll("#list-" + key + " .cs-item").forEach(function(item) {
-        var val = (item.dataset.value || "").toLowerCase();
-        item.style.display = val.includes(query) ? "" : "none";
-    });
-}
-
-function closeAllPanels() {
-    document.querySelectorAll(".cs-panel.open").forEach(function(p) {
-        p.classList.remove("open");
-        var faceEl = document.getElementById("face-" + p.id.replace("panel-", ""));
-        if (faceEl) faceEl.classList.remove("open");
-    });
-    var bd = document.getElementById("mob-backdrop");
-    if (bd) bd.style.display = "none";
 }
 
 function togglePanel(key) {
-    var panel  = document.getElementById("panel-" + key);
-    var face   = document.getElementById("face-"  + key);
-    var isOpen = panel.classList.contains("open");
-
-    /* Close all other open panels first */
-    document.querySelectorAll(".cs-panel.open").forEach(function(p) {
+    document.querySelectorAll(".cs-panel.open").forEach(p => {
         if (p.id !== "panel-" + key) {
             p.classList.remove("open");
-            var f = document.getElementById("face-" + p.id.replace("panel-", ""));
-            if (f) f.classList.remove("open");
+            document.getElementById("face-" + p.id.replace("panel-","")).classList.remove("open");
         }
     });
-
-    if (isOpen) {
-        panel.classList.remove("open");
-        face.classList.remove("open");
-        var bd = document.getElementById("mob-backdrop");
-        if (bd) bd.style.display = "none";
-    } else {
-        panel.classList.add("open");
-        face.classList.add("open");
-        var bd = document.getElementById("mob-backdrop");
-        if (bd) bd.style.display = "block";
-        /* Auto-focus search on open */
-        var srch = document.getElementById("search-" + key);
-        if (srch) setTimeout(function() { srch.focus(); }, 30);
-    }
+    const panel = document.getElementById("panel-" + key);
+    const face  = document.getElementById("face-"  + key);
+    panel.classList.toggle("open");
+    face.classList.toggle("open", panel.classList.contains("open"));
 }
+
 
 function updateFace(key) {
-    var face        = document.getElementById("face-" + key);
-    var container   = document.querySelector('[data-key="' + key + '"]');
-    var placeholder = container ? (container.dataset.placeholder || "Select...") : "Select...";
-    var sel         = selections[key] || new Set();
-    face.textContent = sel.size === 0 ? placeholder
-                     : sel.size === 1 ? [...sel][0]
-                     : sel.size + " selected";
+    const face        = document.getElementById("face-" + key);
+    const placeholder = document.querySelector(`[data-key="${key}"]`).dataset.placeholder;
+    const sel         = selections[key];
+    face.textContent  = sel.size === 0 ? placeholder : sel.size === 1 ? [...sel][0] : sel.size + " selected";
 }
 
-/* FIX 2: Guard document click — don't close if click was inside panel or on face */
-document.addEventListener("click", function(e) {
-    if (e.target.closest && (e.target.closest(".cs-panel") || e.target.closest(".cs-face"))) return;
-    closeAllPanels();
+document.addEventListener("click", () => {
+    document.querySelectorAll(".cs-panel.open").forEach(p => {
+        p.classList.remove("open");
+        document.getElementById("face-" + p.id.replace("panel-","")).classList.remove("open");
+    });
 });
 
 /* ====================================================
@@ -2512,6 +2442,42 @@ function pctBadge(val) {
 async function loadFilters() {
     try {
         const data = await fetch("/filters").then(r => r.json());
+
+        // ── Populate CY dropdowns dynamically from server data ──────────
+        const cyYears = data.cy_years || ["CY24","CY25","CY26"];
+        window._cyYears = cyYears;  // store globally for resetPage7
+
+        function fillCySelect(elId, defaultVal, includeAll) {
+            const el = document.getElementById(elId);
+            if (!el) return;
+            el.innerHTML = "";
+            if (includeAll) {
+                const opt = document.createElement("option");
+                opt.value = ""; opt.textContent = "All CY";
+                el.appendChild(opt);
+            }
+            cyYears.forEach(function(cy, idx) {
+                const opt = document.createElement("option");
+                opt.value = cy;
+                // includeAll = page1/4 style: "CY24"; !includeAll = page7 style: "CY 2024"
+                opt.textContent = includeAll ? cy : ("CY 20" + cy.slice(2));
+                if (defaultVal === "first"  && idx === 0) opt.selected = true;
+                if (defaultVal === "second" && idx === 1) opt.selected = true;
+                if (defaultVal === cy) opt.selected = true;
+                el.appendChild(opt);
+            });
+        }
+
+        // Page 1 — Calendar Year select (show "CY24" style, include All)
+        fillCySelect("cy",       null,     true);
+        // Page 4 — One Pager CY select
+        fillCySelect("op-cy",    null,     true);
+        // Page 7 — Comparison: CY A = first available, CY B = second available
+        fillCySelect("cmp-cy-a", "first",  false);
+        fillCySelect("cmp-cy-b", "second", false);
+
+        updateCmpInfoBanner();
+
         // Page 1
         fillCustomSelect("division", data.division);
         fillCustomSelect("service",  data.service);
@@ -2549,6 +2515,12 @@ async function loadFilters() {
         fillCustomSelect("d6-sa",       data.sa);
         fillCustomSelect("d6-invoice",  data.invoice);
         fillCustomSelect("d6-model",    data.model);
+        // Page 7 — Comparison (Flex)
+        fillCustomSelect("cmp-division", data.division);
+        fillCustomSelect("cmp-service",  data.service);
+        fillCustomSelect("cmp-sa",       data.sa);
+        fillCustomSelect("cmp-invoice",  data.invoice);
+        fillCustomSelect("cmp-model",    data.model);
     } catch(e) {
         console.error("loadFilters failed:", e);
     }
@@ -2996,7 +2968,22 @@ async function loadCurrentMonth() {
    RESET FUNCTIONS
    ==================================================== */
 function resetKeys(keys) {
-    keys.forEach(function(key) { clearSelect(key); });
+    keys.forEach(function(key) {
+        if (selections[key]) {
+            selections[key].clear();
+            var listEl = document.getElementById("list-" + key);
+            if (listEl) {
+                listEl.querySelectorAll(".cs-item").forEach(function(item) {
+                    item.classList.remove("checked");
+                    item.querySelector("input").checked = false;
+                    item.style.display = "";
+                });
+            }
+            var srch = document.getElementById("search-" + key);
+            if (srch) srch.value = "";
+            updateFace(key);
+        }
+    });
 }
 
 function resetPage1() {
@@ -3142,26 +3129,193 @@ async function loadDivMonth26() {
    INIT
    ==================================================== */
 window.onload = function () {
-    // Tab scroll hint — hide when scrolled to end
-    var tabsEl = document.getElementById("tabsEl");
-    var hint   = document.getElementById("tabScrollHint");
-    if (tabsEl && hint) {
-        tabsEl.addEventListener("scroll", function() {
-            var atEnd = tabsEl.scrollLeft + tabsEl.clientWidth >= tabsEl.scrollWidth - 4;
-            hint.style.display = atEnd ? "none" : "flex";
-        });
-        // Scroll active tab into view on tab switch
-        document.querySelectorAll(".tab-btn").forEach(function(btn) {
-            btn.addEventListener("click", function() {
-                btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
-            });
-        });
-    }
     document.querySelectorAll(".custom-select").forEach(buildCustomSelect);
+    // Check for load errors first
+    fetch("/debug").then(r => r.json()).then(function(d) {
+        if (d.load_errors && d.load_errors.length > 0) {
+            var banner = document.getElementById("load-error-banner");
+            var txt    = document.getElementById("load-error-text");
+            if (banner && txt) {
+                txt.innerHTML = d.load_errors.map(function(e) {
+                    return "<div style='margin-bottom:4px;'>• " + e + "</div>";
+                }).join("");
+                banner.style.display = "block";
+            }
+        }
+    }).catch(function() {});
     loadFilters();
     loadCards();
     loadTable();
 };
+/* ====================================================
+   PAGE 7 — COMPARISON (FLEX — ANY TWO CYs)
+   ==================================================== */
+
+function buildCmpParams() {
+    var p = new URLSearchParams();
+    var cya = document.getElementById("cmp-cy-a").value;
+    var cyb = document.getElementById("cmp-cy-b").value;
+    p.append("cy_a", cya);
+    p.append("cy_b", cyb);
+    ["cmp-division","cmp-service","cmp-sa","cmp-invoice","cmp-model"].forEach(function(key) {
+        (selections[key] || new Set()).forEach(function(v) {
+            p.append(key.replace("cmp-",""), v);
+        });
+    });
+    return p.toString();
+}
+
+function onCmpCyChange() {
+    updateCmpInfoBanner();
+}
+
+function updateCmpInfoBanner() {
+    var cya = document.getElementById("cmp-cy-a") ? document.getElementById("cmp-cy-a").value : "";
+    var cyb = document.getElementById("cmp-cy-b") ? document.getElementById("cmp-cy-b").value : "";
+    var txt = document.getElementById("cmp-info-text");
+    if (!txt) return;
+    if (!cya || !cyb) { txt.innerText = "Select two calendar years above and click Apply to compare."; return; }
+    if (cya === cyb) {
+        txt.innerText = "⚠️ Please select two different calendar years to compare.";
+        return;
+    }
+    // Works for any CY label: CY24, CY25, CY26, CY27, CY28, etc.
+    function cyNum(c) { return parseInt(c.replace(/[^0-9]/g, ""), 10) || 0; }
+    var numA = cyNum(cya), numB = cyNum(cyb);
+    var newerLabel = numA > numB ? cya : cyb;
+    var newerYY = Math.max(numA, numB) % 100;  // last 2 digits, e.g. 26
+    var currentYY = new Date().getFullYear() % 100;  // e.g. 26 for 2026
+    var note = "";
+    if (newerYY > currentYY) {
+        note = " " + newerLabel + " has no data yet — no rows will be shown.";
+    } else if (newerYY === currentYY) {
+        note = " Only months available in " + newerLabel + " will be shown (year in progress).";
+    } else {
+        note = " Full 12-month comparison will be shown.";
+    }
+    txt.innerText = "Showing: " + cya + " vs " + cyb + "." + note + " Click Apply to load.";
+}
+
+function applyFlexComparison() {
+    var cya = document.getElementById("cmp-cy-a").value;
+    var cyb = document.getElementById("cmp-cy-b").value;
+    if (cya === cyb) {
+        alert("Please select two different calendar years to compare.");
+        return;
+    }
+    loadFlexComparison();
+}
+
+async function loadFlexComparison() {
+    var wrap = document.getElementById("cmp-content");
+    wrap.innerHTML = '<div class="comp-loading">Loading comparison data…</div>';
+    var cya = document.getElementById("cmp-cy-a").value;
+    var cyb = document.getElementById("cmp-cy-b").value;
+    updateCmpInfoBanner();
+
+    try {
+        var resp = await fetch("/comparison-flex?" + buildCmpParams());
+        var json = await resp.json();
+        var rows = json.rows || [];
+
+        if (!rows.length) {
+            wrap.innerHTML = '<div class="comp-loading">No data available for ' + cya + ' vs ' + cyb + '. ' +
+                'If this is a future year, data will appear once the CSV file is loaded.</div>';
+            return;
+        }
+
+        // Display labels
+        var labelA = cya.replace("CY","CY 20");   // CY24 -> "CY 2024"
+        var labelB = cyb.replace("CY","CY 20");
+
+        // Compute totals
+        var tot = {ia:0,ib:0,la:0,lb:0,sa2:0,sb:0,ta:0,tb:0};
+        rows.forEach(function(r) {
+            tot.ia += r.inflow_a; tot.ib += r.inflow_b;
+            tot.la += r.labour_a; tot.lb += r.labour_b;
+            tot.sa2 += r.spares_a; tot.sb += r.spares_b;
+            tot.ta += r.total_a;  tot.tb += r.total_b;
+        });
+
+        function totPct(a,b) {
+            return a ? ((b-a)/a*100).toFixed(1) : null;
+        }
+
+        function buildFlexTable(title, keyA, keyB, pctKey, isCurrency) {
+            var f = function(v) {
+                return isCurrency ? "\u20b9 " + fmt(v) : Number(Math.round(v||0)).toLocaleString("en-IN");
+            };
+
+            var rows_html = rows.map(function(r) {
+                return "<tr>" +
+                    "<td>" + r.month + "</td>" +
+                    "<td>" + f(r[keyA]) + "</td>" +
+                    "<td>" + f(r[keyB]) + "</td>" +
+                    "<td>" + pctBadge(r[pctKey]) + "</td>" +
+                    "</tr>";
+            }).join("");
+
+            // Totals for footer
+            var fA, fB, fPct;
+            if (keyA === "inflow_a")  { fA=tot.ia; fB=tot.ib; fPct=totPct(tot.ia,tot.ib); }
+            else if (keyA === "labour_a") { fA=tot.la; fB=tot.lb; fPct=totPct(tot.la,tot.lb); }
+            else if (keyA === "spares_a") { fA=tot.sa2; fB=tot.sb; fPct=totPct(tot.sa2,tot.sb); }
+            else { fA=tot.ta; fB=tot.tb; fPct=totPct(tot.ta,tot.tb); }
+
+            return "<div class='comp-section'>" +
+                "<h3>" + title + "</h3>" +
+                "<div class='table-wrap'>" +
+                "<table class='comp-table'>" +
+                "<thead><tr>" +
+                "<th>Month</th>" +
+                "<th>" + labelA + "</th>" +
+                "<th style='background:#17a34a;'>" + labelB + "</th>" +
+                "<th>Growth %</th>" +
+                "</tr></thead>" +
+                "<tbody>" + rows_html + "</tbody>" +
+                "<tfoot><tr>" +
+                "<td>Total</td>" +
+                "<td>" + f(fA) + "</td>" +
+                "<td style='color:#15803d;font-weight:700;'>" + f(fB) + "</td>" +
+                "<td>" + pctBadge(fPct !== null ? parseFloat(fPct) : null) + "</td>" +
+                "</tr></tfoot>" +
+                "</table></div></div>";
+        }
+
+        wrap.innerHTML =
+            buildFlexTable("Inflow Comparison -- " + labelA + " vs " + labelB + " (Unique ROs)", "inflow_a", "inflow_b", "inflow_pct", false) +
+            buildFlexTable("Labour Revenue -- " + labelA + " vs " + labelB, "labour_a", "labour_b", "labour_pct", true) +
+            buildFlexTable("Spares Revenue -- " + labelA + " vs " + labelB, "spares_a", "spares_b", "spares_pct", true) +
+            buildFlexTable("Total Revenue -- " + labelA + " vs " + labelB, "total_a", "total_b", "total_pct", true);
+
+    } catch(e) {
+        wrap.innerHTML = '<div class="comp-loading">Error loading comparison data: ' + e.message + '</div>';
+        console.error("FlexComparison load failed:", e);
+    }
+}
+
+function exportPage7() {
+    var cya = document.getElementById("cmp-cy-a").value;
+    var cyb = document.getElementById("cmp-cy-b").value;
+    _triggerExport(
+        "/export-comparison-flex?" + buildCmpParams(),
+        "Renault_" + cya + "_vs_" + cyb + "_Comparison.xlsx",
+        "export-btn-p7"
+    );
+}
+
+function resetPage7() {
+    // Reset CY selects to first/second available CYs dynamically
+    var years = window._cyYears || [];
+    var elA = document.getElementById("cmp-cy-a");
+    var elB = document.getElementById("cmp-cy-b");
+    if (elA && years.length > 0) elA.value = years[0];
+    if (elB && years.length > 1) elB.value = years[1];
+    ["cmp-division","cmp-service","cmp-sa","cmp-invoice","cmp-model"].forEach(function(k) { clearSelect(k); });
+    document.getElementById("cmp-content").innerHTML = '<div class="comp-loading">Select a year pair and click Apply to load comparison data…</div>';
+    updateCmpInfoBanner();
+}
+
 /* ====================================================
    FILTER SYSTEM — COMPLETE IMPLEMENTATION
    ==================================================== */
@@ -3174,9 +3328,10 @@ var filterGroups = {
     "d6-division": [null,    ["d6-service","d6-sa","d6-invoice","d6-model"]],
     "op-division": ["op-cy", ["op-service","op-sa","op-invoice","op-model","op-month"]],
     "cm-division": [null,    ["cm-service","cm-sa","cm-model"]],
+    "cmp-division":[null,    ["cmp-service","cmp-sa","cmp-invoice","cmp-model"]],
 };
 
-var DIV_KEYS = ["division","c-division","d-division","d6-division","op-division","cm-division"];
+var DIV_KEYS = ["division","c-division","d-division","d6-division","op-division","cm-division","cmp-division"];
 
 function isDivisionKey(key) {
     return DIV_KEYS.indexOf(key) !== -1;
@@ -3187,7 +3342,6 @@ function fillCustomSelect(key, list) {
     var listEl = document.getElementById("list-" + key);
     if (!listEl) return;
     if (!selections[key]) selections[key] = new Set();
-    _cachedOptions[key] = list.slice();  // cache for reset
     listEl.innerHTML = "";
     list.forEach(function(v) {
         var item = document.createElement("div");
@@ -3200,22 +3354,13 @@ function fillCustomSelect(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-
-        /* FIX 3: Row click toggles checkbox — works on desktop where
-           clicking label/row text would otherwise do nothing */
-        item.addEventListener("click", function(e) {
-            e.stopPropagation();
-            if (e.target !== chk) { chk.checked = !chk.checked; }
+        chk.addEventListener("change", function() {
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
             if (isDivisionKey(key)) refreshDependentFilters(key);
         });
-        chk.addEventListener("change", function(e) {
-            e.stopPropagation();
-        });
-
         listEl.appendChild(item);
     });
     updateFace(key);
@@ -3248,20 +3393,13 @@ function fillDropdownOnly(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-
-        /* FIX 3: Row click toggles checkbox */
-        item.addEventListener("click", function(e) {
-            e.stopPropagation();
-            if (e.target !== chk) { chk.checked = !chk.checked; }
+        // Attach change listener (no cascade for dependent keys)
+        chk.addEventListener("change", function() {
             if (chk.checked) selections[key].add(v);
             else             selections[key].delete(v);
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
         });
-        chk.addEventListener("change", function(e) {
-            e.stopPropagation();
-        });
-
         listEl.appendChild(item);
     });
     updateFace(key);
@@ -3326,12 +3464,12 @@ async function refreshDependentFilters(divKey) {
             var data = await resp.json();
             var keyMap = {
                 "service":"service","c-service":"service","d-service":"service",
-                "d6-service":"service","op-service":"service",
-                "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa",
+                "d6-service":"service","op-service":"service","cmp-service":"service",
+                "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa","cmp-sa":"sa",
                 "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice",
-                "d6-invoice":"invoice","op-invoice":"invoice",
+                "d6-invoice":"invoice","op-invoice":"invoice","cmp-invoice":"invoice",
                 "model":"model","c-model":"model","d-model":"model",
-                "d6-model":"model","op-model":"model",
+                "d6-model":"model","op-model":"model","cmp-model":"model",
                 "month":"month","op-month":"month",
             };
             depKeys.forEach(function(dk) {
@@ -3352,12 +3490,12 @@ async function refreshDependentFilters(divKey) {
         var data = await resp.json();
         var keyMap = {
             "service":"service","c-service":"service","d-service":"service",
-            "d6-service":"service","op-service":"service",
-            "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa",
+            "d6-service":"service","op-service":"service","cmp-service":"service",
+            "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa","cmp-sa":"sa",
             "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice",
-            "d6-invoice":"invoice","op-invoice":"invoice",
+            "d6-invoice":"invoice","op-invoice":"invoice","cmp-invoice":"invoice",
             "model":"model","c-model":"model","d-model":"model",
-            "d6-model":"model","op-model":"model",
+            "d6-model":"model","op-model":"model","cmp-model":"model",
             "month":"month","op-month":"month",
         };
         depKeys.forEach(function(dk) {
@@ -3372,5 +3510,14 @@ async function refreshDependentFilters(divKey) {
 
 </script>
 </body>
-</html>""")
-# ── Render uses: uvicorn main:app --host 0.0.0.0 --port 10000 ──
+</html>"""
+    return Response(content=html_content.encode("utf-8"), media_type="text/html; charset=utf-8")
+# ---------------- AUTO OPEN ----------------
+
+def open_browser():
+    webbrowser.open("http://127.0.0.1:8000")
+
+
+if __name__ == "__main__":
+    threading.Timer(1, open_browser).start()
+    uvicorn.run(app, host="127.0.0.1", port=8000)
