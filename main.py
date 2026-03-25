@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 import pandas as pd
@@ -29,9 +28,12 @@ def indian_format(n: float) -> str:
 
     return ("-" if negative else "") + result
 
-CY24_PATH = r"E:\Renault\Invoice Report CY24.csv"
-CY25_PATH = r"E:\Renault\Invoice Report CY25.csv"
-CY26_PATH = r"E:\Renault\Invoice Report CY26.csv"  # Jan & Feb only
+import os as _os
+# Render: CSV files live in the repo root alongside main.py
+# Local: set env vars CY24_PATH / CY25_PATH / CY26_PATH to override
+CY24_PATH = _os.getenv("CY24_PATH", "Invoice Report CY24.csv")
+CY25_PATH = _os.getenv("CY25_PATH", "Invoice Report CY25.csv")
+CY26_PATH = _os.getenv("CY26_PATH", "Invoice Report CY26.csv")
 
 BRANCH_CODE_TO_NAME = {
     "AKJA": "AKOLA",
