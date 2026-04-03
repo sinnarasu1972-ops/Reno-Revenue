@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Env-based CSV paths (Render env vars or local defaults) ──
+# ── Env-based CSV paths ──
 CY24_PATH = os.getenv("CY24_PATH", "Invoice Report CY24.csv")
 CY25_PATH = os.getenv("CY25_PATH", "Invoice Report CY25.csv")
 CY26_PATH = os.getenv("CY26_PATH", "Invoice Report CY26.csv")
@@ -24,14 +24,20 @@ GSHEET_CSV = os.getenv(
 df            = pd.DataFrame()
 df_cancelled  = pd.DataFrame()
 
+# Current live month label — April 2026 from Google Sheet
+CURRENT_MONTH_NAME  = "Apr"          # month abbreviation served by GSheet
+CURRENT_MONTH_LABEL = "April 2026"
+CURRENT_MONTH_TAB   = "Current Month (Apr)"
+
+# CY26 CSV covers Jan-Mar. April onwards → Google Sheet only.
+CY26_CSV_MONTHS = {"Jan", "Feb", "Mar"}   # populated also from actual data at startup
+
 # ---------------- HELPERS ----------------
 
 def indian_format(n: float) -> str:
-    """Format number in Indian style: 1,23,45,678 (no decimals)"""
     n = round(float(n))
     negative = n < 0
     n = abs(int(n))
-
     s = str(n)
     if len(s) <= 3:
         result = s
@@ -41,7 +47,6 @@ def indian_format(n: float) -> str:
         while s:
             result = s[-2:] + "," + result
             s = s[:-2]
-
     return ("-" if negative else "") + result
 
 BRANCH_CODE_TO_NAME = {
@@ -59,12 +64,10 @@ BRANCH_CODE_TO_NAME = {
     "JGJB": "JALGAON",
 }
 
-
 # ---------------- LOAD DATA ----------------
 
-ORIGINAL_CSV_COLS = []  # populated by load_data()
+ORIGINAL_CSV_COLS = []
 
-# Only load columns we actually need — saves ~60% memory vs full load
 KEEP_COLS = [
     "Repair Order#",
     "RO Owner First Name",
@@ -83,7 +86,6 @@ KEEP_COLS = [
 ]
 
 def _read_lean(path: str, label: str) -> pd.DataFrame:
-    """Read only KEEP_COLS that exist in this file, dtype=str minimises peak RAM."""
     try:
         header = pd.read_csv(path, nrows=0)
         header.columns = header.columns.str.strip()
@@ -99,7 +101,7 @@ def _read_lean(path: str, label: str) -> pd.DataFrame:
 
 
 def load_data():
-    global ORIGINAL_CSV_COLS
+    global ORIGINAL_CSV_COLS, CY26_CSV_MONTHS
 
     frames = []
     for path, label in [(CY24_PATH, "CY24"), (CY25_PATH, "CY25"), (CY26_PATH, "CY26")]:
@@ -119,23 +121,18 @@ def load_data():
     del frames
     gc.collect()
 
-    # Capture original CSV column order BEFORE adding computed cols
     ORIGINAL_CSV_COLS = [c for c in df.columns if c != "CY"]
 
-    # Division (branch code -> name)
     _raw_div = df["Repair Order#"].astype(str).str[2:6]
     df["Division"] = _raw_div.map(BRANCH_CODE_TO_NAME).fillna(_raw_div)
 
-    # SA Name
     first = df.get("RO Owner First Name", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
     last  = df.get("RO Owner Last Name",  pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
     df["SA Name"] = (first + " " + last).str.strip()
 
-    # Model (first word, upper)
     if "Vehicle Model" in df.columns:
         df["Model"] = df["Vehicle Model"].fillna("").astype(str).str.strip().str.split().str[0].str.upper()
 
-    # Dates: DD-MM-YYYY or DD/MM/YYYY HH:MM:SS
     for date_col in ["Invoice Date", "Repair Order Date"]:
         if date_col not in df.columns:
             continue
@@ -146,15 +143,12 @@ def load_data():
             parsed[mask] = pd.to_datetime(raw[mask], format="%d/%m/%Y", errors="coerce")
         df[date_col] = parsed
 
-    # Month
     if "Invoice Date" in df.columns:
         df["Month"] = df["Invoice Date"].dt.strftime("%b")
 
-    # TAT (Int16 saves memory vs int64)
     if "Invoice Date" in df.columns and "Repair Order Date" in df.columns:
         df["TAT (Days)"] = (df["Invoice Date"] - df["Repair Order Date"]).dt.days.astype("Int16")
 
-    # Amounts as float32 (half the memory of float64)
     for col in ["Net Taxable Labor Amount", "Net Taxable Parts Amt"]:
         if col in df.columns:
             df[col] = (
@@ -168,7 +162,6 @@ def load_data():
         else:
             df[col] = np.float32(0)
 
-    # Downcast low-cardinality string columns to category
     for col in ["CY", "Division", "Service Type", "Invoice Type", "Model", "Month", "SA Name"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
@@ -176,7 +169,12 @@ def load_data():
     gc.collect()
     logger.info(f"RAM after enrich: {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
 
-    # Status split
+    # Populate CY26_CSV_MONTHS from actual data
+    cy26_mask = df["CY"] == "CY26"
+    if cy26_mask.any():
+        CY26_CSV_MONTHS = set(df.loc[cy26_mask, "Month"].dropna().unique().tolist())
+    logger.info(f"CY26 CSV months: {CY26_CSV_MONTHS}")
+
     status_col = next(
         (c for c in df.columns if c.strip().lower() in ("status", "invoice status", "ro status")),
         None
@@ -194,11 +192,9 @@ def load_data():
     gc.collect()
 
     logger.info(f"Active: {len(df_active)} | Cancelled: {len(df_cancelled)}")
-    logger.info(f"Final RAM: {df_active.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
     return df_active, df_cancelled
 
 
-# ── Lifespan: load data on startup ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global df, df_cancelled
@@ -209,9 +205,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown.")
 
 
-
-# ── App with lifespan ──
-app = FastAPI(title="Renault Revenue", version="15.0", lifespan=lifespan)
+app = FastAPI(title="Renault Revenue", version="16.0", lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
@@ -222,10 +216,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Health endpoint ──
 @app.get("/health")
 def health():
-    return {"status": "ok", "active_rows": len(df), "cancelled_rows": len(df_cancelled)}
+    return {
+        "status": "ok",
+        "active_rows": len(df),
+        "cancelled_rows": len(df_cancelled),
+        "cy26_csv_months": sorted(list(CY26_CSV_MONTHS)),
+        "current_month": CURRENT_MONTH_NAME,
+    }
 
 # ---------------- FILTERS ----------------
 
@@ -246,21 +245,15 @@ def filters():
         ),
     }
 
-
-
-# ---------------- DEPENDENT FILTERS ----------------
-
 @app.get("/filters-dep")
 def filters_dep(
     division: list[str] = Query(None),
     cy:       str = None,
 ):
-    """Returns filtered options based on selected divisions (and optionally CY)."""
     MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     data = df.copy()
     if cy:       data = data[data["CY"] == cy]
     if division: data = data[data["Division"].isin(division)]
-
     return {
         "service":  sorted(data["Service Type"].dropna().unique().tolist()),
         "sa":       sorted(data["SA Name"].dropna().unique().tolist()),
@@ -271,7 +264,6 @@ def filters_dep(
             key=lambda m: MONTHS.index(m) if m in MONTHS else 99
         ),
     }
-
 
 # ---------------- CARDS ----------------
 
@@ -286,7 +278,6 @@ def cards(
     cy: str = None,
 ):
     data = df.copy()
-
     if cy:       data = data[data["CY"] == cy]
     if division: data = data[data["Division"].isin(division)]
     if service:  data = data[data["Service Type"].isin(service)]
@@ -294,7 +285,6 @@ def cards(
     if invoice:  data = data[data["Invoice Type"].isin(invoice)]
     if month:    data = data[data["Month"].isin(month)]
     if model:    data = data[data["Model"].isin(model)]
-
     return {
         "inflow24": int(data[data["CY"] == "CY24"]["Repair Order#"].nunique()),
         "inflow25": int(data[data["CY"] == "CY25"]["Repair Order#"].nunique()),
@@ -303,7 +293,6 @@ def cards(
         "spares":   "₹ " + indian_format(data['Net Taxable Parts Amt'].sum()),
         "total":    "₹ " + indian_format(data['Net Taxable Labor Amount'].sum() + data['Net Taxable Parts Amt'].sum()),
     }
-
 
 # ---------------- TABLE ----------------
 
@@ -318,7 +307,6 @@ def table(
     cy: str = None,
 ):
     data = df.copy()
-
     if cy:       data = data[data["CY"] == cy]
     if division: data = data[data["Division"].isin(division)]
     if service:  data = data[data["Service Type"].isin(service)]
@@ -326,39 +314,30 @@ def table(
     if invoice:  data = data[data["Invoice Type"].isin(invoice)]
     if month:    data = data[data["Month"].isin(month)]
     if model:    data = data[data["Model"].isin(model)]
-
     keep = ["Division", "Repair Order#", "SA Name", "Vehicle Reg#",
             "Service Type", "Net Taxable Labor Amount", "Net Taxable Parts Amt"]
     out = data[keep].head(500).copy()
     out["Total Revenue"] = out["Net Taxable Labor Amount"] + out["Net Taxable Parts Amt"]
     return out.to_dict(orient="records")
 
-
-# ---------------- SHARED EXPORT HELPER ----------------
+# ---------------- EXPORT HELPERS ----------------
 
 def _style_sheet(ws, highlight_last_n=3):
-    """Auto-fit columns and highlight last N header cells in green."""
     from openpyxl.styles import PatternFill, Font
-    green_fill  = PatternFill("solid", fgColor="17A34A")
-    red_fill    = PatternFill("solid", fgColor="DC2626")
-    white_font  = Font(color="FFFFFF", bold=True)
-    blue_fill   = PatternFill("solid", fgColor="1D4ED8")
-
+    green_fill = PatternFill("solid", fgColor="17A34A")
+    white_font = Font(color="FFFFFF", bold=True)
+    blue_fill  = PatternFill("solid", fgColor="1D4ED8")
     for col_cells in ws.columns:
         max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
         ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 50)
-
     total_cols = ws.max_column
-    # Header row — blue for all, green for last N (data cols)
     for ci in range(1, total_cols + 1):
         cell = ws.cell(row=1, column=ci)
         fill = green_fill if ci > total_cols - highlight_last_n else blue_fill
         cell.fill = fill
         cell.font = white_font
 
-
 def _style_cancelled_sheet(ws):
-    """Style the Cancelled sheet header in red."""
     from openpyxl.styles import PatternFill, Font
     red_fill   = PatternFill("solid", fgColor="DC2626")
     white_font = Font(color="FFFFFF", bold=True)
@@ -370,46 +349,22 @@ def _style_cancelled_sheet(ws):
         cell.fill = red_fill
         cell.font = white_font
 
-
 def _build_export_cols(data):
-    """Return columns in original CSV file order, with Labour/Parts/Total/TAT at the end.
-
-    Final column layout:
-      1. All original CSV columns in file order (Net Taxable Labour/Parts excluded — moved to end)
-      2. Computed helper cols not in original CSV: Division, SA Name, Model, Month, CY
-      3. Net Taxable Labor Amount
-      4. Net Taxable Parts Amt
-      5. Total  (Labour + Parts)
-      6. TAT (Days)  (Invoice Date - Repair Order Date)
-    Returns: (export_cols list, data with Total column added)
-    """
     tail_fixed = ["Net Taxable Labor Amount", "Net Taxable Parts Amt"]
     added_cols = ["Division", "SA Name", "Model", "Month", "CY"]
-
-    # Original CSV cols in file order, skip the two that move to tail
     csv_cols   = [c for c in ORIGINAL_CSV_COLS if c in data.columns and c not in tail_fixed]
-    # Our computed helper cols not already in csv_cols
     extra_cols = [c for c in added_cols if c in data.columns and c not in csv_cols]
-
     export_cols = csv_cols + extra_cols
-
-    # Append Labour, Parts
     for col in tail_fixed:
         if col in data.columns:
             export_cols.append(col)
-
-    # Add Total (Labour + Parts) column
     data = data.copy()
     if "Net Taxable Labor Amount" in data.columns and "Net Taxable Parts Amt" in data.columns:
         data["Total"] = data["Net Taxable Labor Amount"] + data["Net Taxable Parts Amt"]
         export_cols.append("Total")
-
-    # TAT at the very end
     if "TAT (Days)" in data.columns:
         export_cols.append("TAT (Days)")
-
     return export_cols, data
-
 
 def _apply_standard_filters(data, canc, cy, division, service, sa, invoice, month, model):
     if cy:       data = data[data["CY"] == cy];       canc = canc[canc["CY"] == cy]
@@ -421,24 +376,19 @@ def _apply_standard_filters(data, canc, cy, division, service, sa, invoice, mont
     if model:    data = data[data["Model"].isin(model)];        canc = canc[canc["Model"].isin(model)]
     return data, canc
 
-
 def _write_cancelled_sheet(writer, canc):
-    """Write Cancelled rows to a red-styled sheet in the workbook."""
     if canc.empty:
-        canc_placeholder = pd.DataFrame([{"Note": "No Cancelled records for current filters."}])
-        canc_placeholder.to_excel(writer, index=False, sheet_name="Cancelled")
+        pd.DataFrame([{"Note": "No Cancelled records for current filters."}]).to_excel(
+            writer, index=False, sheet_name="Cancelled")
     else:
         canc_cols, canc = _build_export_cols(canc)
         canc[canc_cols].to_excel(writer, index=False, sheet_name="Cancelled")
     _style_cancelled_sheet(writer.sheets["Cancelled"])
 
-
 def _write_invoice_data_sheet(writer, data):
-    """Write a full raw Invoice Data sheet (same as Page 1 export) — blue header, last 4 cols green."""
     export_cols, data = _build_export_cols(data)
     data[export_cols].to_excel(writer, index=False, sheet_name="Invoice Data")
     _style_sheet(writer.sheets["Invoice Data"], highlight_last_n=4)
-
 
 def _stream_excel(output, filename):
     output.seek(0)
@@ -448,9 +398,7 @@ def _stream_excel(output, filename):
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 
-
-# ---------------- EXPORT — PAGE 1 (Invoice Data) ----------------
-
+# ---------------- EXPORT PAGE 1 ----------------
 
 @app.get("/export")
 def export(
@@ -465,19 +413,15 @@ def export(
     data = df.copy()
     canc = df_cancelled.copy()
     data, canc = _apply_standard_filters(data, canc, cy, division, service, sa, invoice, month, model)
-
     export_cols, data = _build_export_cols(data)
-
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         data[export_cols].to_excel(writer, index=False, sheet_name="Invoice Data")
         _style_sheet(writer.sheets["Invoice Data"], highlight_last_n=4)
         _write_cancelled_sheet(writer, canc)
-
     return _stream_excel(output, "Renault_Invoice_Export.xlsx")
 
-
-# ---------------- EXPORT — PAGE 2 (CY Comparison) ----------------
+# ---------------- EXPORT PAGE 2 ----------------
 
 @app.get("/export-comparison")
 def export_comparison(
@@ -525,7 +469,6 @@ def export_comparison(
                                   cy24["Net Taxable Labor Amount"].sum() + cy24["Net Taxable Parts Amt"].sum()),
         })
 
-    # Build full active data for Invoice Data sheet
     inv_data = df.copy()
     inv_canc = df_cancelled.copy()
     if division: inv_data = inv_data[inv_data["Division"].isin(division)]; inv_canc = inv_canc[inv_canc["Division"].isin(division)]
@@ -540,11 +483,9 @@ def export_comparison(
         _style_sheet(writer.sheets["CY Comparison"], highlight_last_n=0)
         _write_invoice_data_sheet(writer, inv_data)
         _write_cancelled_sheet(writer, inv_canc)
-
     return _stream_excel(output, "Renault_CY_Comparison_Export.xlsx")
 
-
-# ---------------- EXPORT — PAGE 3 (Division-Month CY24 vs CY25) ----------------
+# ---------------- EXPORT PAGE 3 ----------------
 
 @app.get("/export-division-month")
 def export_division_month(
@@ -585,11 +526,9 @@ def export_division_month(
         _style_sheet(writer.sheets["Division-Month"], highlight_last_n=0)
         _write_invoice_data_sheet(writer, data)
         _write_cancelled_sheet(writer, canc)
-
     return _stream_excel(output, "Renault_DivisionMonth_Export.xlsx")
 
-
-# ---------------- EXPORT — PAGE 4 (One Pager) ----------------
+# ---------------- EXPORT PAGE 4 ----------------
 
 @app.get("/export-one-pager")
 def export_one_pager(
@@ -658,11 +597,9 @@ def export_one_pager(
         _style_sheet(writer.sheets["One Pager"], highlight_last_n=0)
         _write_invoice_data_sheet(writer, data)
         _write_cancelled_sheet(writer, canc)
-
     return _stream_excel(output, "Renault_OnePager_Export.xlsx")
 
-
-# ---------------- EXPORT — PAGE 5 (Current Month) ----------------
+# ---------------- EXPORT PAGE 5 (Current Month — April from GSheet) ----------------
 
 @app.get("/export-current-month")
 def export_current_month(
@@ -673,33 +610,29 @@ def export_current_month(
 ):
     import requests as req
     try:
-        resp = req.get(
-            "https://docs.google.com/spreadsheets/d/e/2PACX-1vSqiJ-d8D6IFLqWoBSwYyDG5-gewEzAob_CvM6CGC-Y8u_VAe_u8YklXn5nzR3DwtJBMNaxJQCf_Zmr/pub?output=csv",
-            timeout=5
-        )
+        resp = req.get(GSHEET_CSV, timeout=5)
         resp.raise_for_status()
         from io import StringIO
         gdf = pd.read_csv(StringIO(resp.text), low_memory=False)
         gdf.columns = gdf.columns.str.strip()
     except Exception as e:
-        from fastapi.responses import JSONResponse
         return JSONResponse(status_code=503, content={"error": "Google Sheet unavailable: " + str(e)})
 
     col_map = {}
     for c in gdf.columns:
         cl = c.strip().lower()
-        if "invoice date" in cl:              col_map[c] = "Invoice Date"
+        if "invoice date" in cl:                               col_map[c] = "Invoice Date"
         elif "repair order#" in cl or "repair order #" in cl: col_map[c] = "Repair Order#"
-        elif "repair order date" in cl:       col_map[c] = "Repair Order Date"
-        elif "vehicle model" in cl:           col_map[c] = "Vehicle Model"
-        elif "vehicle reg" in cl:             col_map[c] = "Vehicle Reg#"
-        elif "service type" in cl:            col_map[c] = "Service Type"
-        elif "invoice type" in cl:            col_map[c] = "Invoice Type"
-        elif "ro owner first" in cl:          col_map[c] = "RO Owner First Name"
-        elif "ro owner last" in cl:           col_map[c] = "RO Owner Last Name"
-        elif "net taxable labor" in cl:       col_map[c] = "Net Taxable Labor Amount"
-        elif "net taxable parts" in cl:       col_map[c] = "Net Taxable Parts Amt"
-        elif cl in ("status", "invoice status", "ro status"): col_map[c] = "Status"
+        elif "repair order date" in cl:                        col_map[c] = "Repair Order Date"
+        elif "vehicle model" in cl:                            col_map[c] = "Vehicle Model"
+        elif "vehicle reg" in cl:                              col_map[c] = "Vehicle Reg#"
+        elif "service type" in cl:                             col_map[c] = "Service Type"
+        elif "invoice type" in cl:                             col_map[c] = "Invoice Type"
+        elif "ro owner first" in cl:                           col_map[c] = "RO Owner First Name"
+        elif "ro owner last" in cl:                            col_map[c] = "RO Owner Last Name"
+        elif "net taxable labor" in cl:                        col_map[c] = "Net Taxable Labor Amount"
+        elif "net taxable parts" in cl:                        col_map[c] = "Net Taxable Parts Amt"
+        elif cl in ("status", "invoice status", "ro status"):  col_map[c] = "Status"
     gdf = gdf.rename(columns=col_map)
 
     if "Repair Order#" in gdf.columns:
@@ -716,7 +649,6 @@ def export_current_month(
         else:
             gdf[col] = 0.0
 
-    # Split cancelled
     if "Status" in gdf.columns:
         canc_mask = gdf["Status"].astype(str).str.strip().str.lower() == "cancelled"
     else:
@@ -729,7 +661,6 @@ def export_current_month(
     if sa       and "SA Name" in gdf_active.columns:      gdf_active = gdf_active[gdf_active["SA Name"].isin(sa)]
     if model    and "Model" in gdf_active.columns:        gdf_active = gdf_active[gdf_active["Model"].isin(model)]
 
-    # Drop any internal helper cols before export
     gdf_active = gdf_active.drop(columns=[c for c in ["_cat","Total Revenue"] if c in gdf_active.columns])
     gdf_export_cols, gdf_active = _build_export_cols(gdf_active)
 
@@ -738,11 +669,9 @@ def export_current_month(
         gdf_active[gdf_export_cols].to_excel(writer, index=False, sheet_name="Invoice Data")
         _style_sheet(writer.sheets["Invoice Data"], highlight_last_n=4)
         _write_cancelled_sheet(writer, gdf_canc)
-
     return _stream_excel(output, "Renault_CurrentMonth_Export.xlsx")
 
-
-# ---------------- EXPORT — PAGE 6 (Division-Month CY25 vs CY26) ----------------
+# ---------------- EXPORT PAGE 6 (Division-Month CY25 vs CY26 — Jan/Feb/Mar from CSV) ----------------
 
 @app.get("/export-division-month-cy26")
 def export_division_month_cy26(
@@ -787,11 +716,9 @@ def export_division_month_cy26(
         _style_sheet(writer.sheets["Div-Month CY26"], highlight_last_n=0)
         _write_invoice_data_sheet(writer, data)
         _write_cancelled_sheet(writer, canc)
-
     return _stream_excel(output, "Renault_DivMonth_CY26_Export.xlsx")
 
-
-# ---------------- COMPARISON ----------------
+# ---------------- COMPARISON (CY24 vs CY25) ----------------
 
 @app.get("/comparison")
 def comparison(
@@ -818,21 +745,17 @@ def comparison(
     for month in MONTHS:
         cy24 = base24[base24["Month"] == month]
         cy25 = base25[base25["Month"] == month]
-
         inflow24 = int(cy24["Repair Order#"].nunique())
         inflow25 = int(cy25["Repair Order#"].nunique())
         labour24 = float(cy24["Net Taxable Labor Amount"].sum())
         labour25 = float(cy25["Net Taxable Labor Amount"].sum())
         spares24 = float(cy24["Net Taxable Parts Amt"].sum())
         spares25 = float(cy25["Net Taxable Parts Amt"].sum())
-
         def pct(new, old):
             if old == 0: return None
             return round((new - old) / old * 100, 2)
-
         if inflow24 == 0 and inflow25 == 0:
             continue
-
         result.append({
             "month":      month,
             "inflow24":   inflow24,  "inflow25":   inflow25,  "inflow_pct": pct(inflow25, inflow24),
@@ -842,11 +765,9 @@ def comparison(
             "total25":    labour25 + spares25,
             "total_pct":  pct(labour25 + spares25, labour24 + spares24),
         })
-
     return result
 
-
-# ---------------- DIVISION-MONTH ----------------
+# ---------------- DIVISION-MONTH (CY24 vs CY25) ----------------
 
 @app.get("/division-month")
 def division_month(
@@ -857,7 +778,6 @@ def division_month(
     model:    list[str] = Query(None),
 ):
     MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-
     data = df.copy()
     if division: data = data[data["Division"].isin(division)]
     if service:  data = data[data["Service Type"].isin(service)]
@@ -866,8 +786,6 @@ def division_month(
     if model:    data = data[data["Model"].isin(model)]
 
     divisions = sorted(data["Division"].dropna().unique().tolist())
-
-    # Build pivot: for each division, one row with values per month
     rows = []
     for div in divisions:
         div_data = data[data["Division"] == div]
@@ -884,12 +802,9 @@ def division_month(
             row[f"t24_{month}"] = row[f"l24_{month}"] + row[f"s24_{month}"]
             row[f"t25_{month}"] = row[f"l25_{month}"] + row[f"s25_{month}"]
         rows.append(row)
-
     return {"divisions": divisions, "months": MONTHS, "rows": rows}
 
-
-
-# ---------------- DIVISION-MONTH CY25 vs CY26 ----------------
+# ---------------- DIVISION-MONTH CY25 vs CY26 (Jan/Feb/Mar from CSV) ----------------
 
 @app.get("/division-month-cy26")
 def division_month_cy26(
@@ -901,7 +816,6 @@ def division_month_cy26(
 ):
     try:
         MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-
         data = df.copy()
         if division: data = data[data["Division"].isin(division)]
         if service:  data = data[data["Service Type"].isin(service)]
@@ -909,14 +823,12 @@ def division_month_cy26(
         if invoice:  data = data[data["Invoice Type"].isin(invoice)]
         if model:    data = data[data["Model"].isin(model)]
 
-        # Only show months that exist in CY26
+        # Only show months that exist in CY26 CSV (Jan, Feb, Mar)
         cy26_months = sorted(
             data[data["CY"] == "CY26"]["Month"].dropna().unique().tolist(),
             key=lambda m: MONTHS.index(m) if m in MONTHS else 99
         )
-
         divisions = sorted(data["Division"].dropna().unique().tolist())
-
         rows = []
         for div in divisions:
             div_data = data[data["Division"] == div]
@@ -933,13 +845,11 @@ def division_month_cy26(
                 row[f"t25_{month}"] = row[f"l25_{month}"] + row[f"s25_{month}"]
                 row[f"t26_{month}"] = row[f"l26_{month}"] + row[f"s26_{month}"]
             rows.append(row)
-
         return {"divisions": divisions, "months": cy26_months, "rows": rows}
     except Exception as e:
         return {"divisions": [], "months": [], "rows": [], "error": str(e)}
 
-
-# ---------------- ONE PAGER REPORT ----------------
+# ---------------- ONE PAGER ----------------
 
 @app.get("/one-pager")
 def one_pager(
@@ -951,16 +861,16 @@ def one_pager(
     model:    list[str] = Query(None),
     cy:       str = None,
 ):
-    # ── If CY26 requested, check which months need Google Sheet ────────────
-    # CY26 CSV has Jan+Feb only. Any other month (e.g. Mar) must come from GSheet.
-    cy26_csv_months = set(df[df["CY"] == "CY26"]["Month"].dropna().unique().tolist())
-    need_gsheet = (
-        cy == "CY26" and
-        month and
-        any(m not in cy26_csv_months for m in month)
-    )
-    # Also fetch if CY26 + no month filter (user wants all CY26 including live month)
-    need_gsheet = need_gsheet or (cy == "CY26" and not month)
+    # For CY26: all data (Jan+Feb+Mar) is in CSV. April is Google Sheet only.
+    # GSheet is ONLY needed if cy==CY26 AND month includes Apr (or no month filter and we want live Apr too)
+    need_gsheet = False
+    if cy == "CY26":
+        if month:
+            # Need GSheet if any selected month is outside CSV coverage
+            need_gsheet = any(m not in CY26_CSV_MONTHS for m in month)
+        else:
+            # No month filter → include April from GSheet as well
+            need_gsheet = True
 
     gsheet_df = None
     if need_gsheet:
@@ -975,17 +885,17 @@ def one_pager(
             col_map = {}
             for c in gdf.columns:
                 cl = c.strip().lower()
-                if "invoice date" in cl:                             col_map[c] = "Invoice Date"
+                if "invoice date" in cl:                               col_map[c] = "Invoice Date"
                 elif "repair order#" in cl or "repair order #" in cl: col_map[c] = "Repair Order#"
-                elif "repair order date" in cl:                      col_map[c] = "Repair Order Date"
-                elif "vehicle model" in cl:                          col_map[c] = "Vehicle Model"
-                elif "vehicle reg" in cl:                            col_map[c] = "Vehicle Reg#"
-                elif "service type" in cl:                           col_map[c] = "Service Type"
-                elif "invoice type" in cl:                           col_map[c] = "Invoice Type"
-                elif "ro owner first" in cl:                         col_map[c] = "RO Owner First Name"
-                elif "ro owner last" in cl:                          col_map[c] = "RO Owner Last Name"
-                elif "net taxable labor" in cl:                      col_map[c] = "Net Taxable Labor Amount"
-                elif "net taxable parts" in cl:                      col_map[c] = "Net Taxable Parts Amt"
+                elif "repair order date" in cl:                        col_map[c] = "Repair Order Date"
+                elif "vehicle model" in cl:                            col_map[c] = "Vehicle Model"
+                elif "vehicle reg" in cl:                              col_map[c] = "Vehicle Reg#"
+                elif "service type" in cl:                             col_map[c] = "Service Type"
+                elif "invoice type" in cl:                             col_map[c] = "Invoice Type"
+                elif "ro owner first" in cl:                           col_map[c] = "RO Owner First Name"
+                elif "ro owner last" in cl:                            col_map[c] = "RO Owner Last Name"
+                elif "net taxable labor" in cl:                        col_map[c] = "Net Taxable Labor Amount"
+                elif "net taxable parts" in cl:                        col_map[c] = "Net Taxable Parts Amt"
             gdf = gdf.rename(columns=col_map)
 
             if "Repair Order#" in gdf.columns:
@@ -996,7 +906,6 @@ def one_pager(
             if "Vehicle Model" in gdf.columns:
                 gdf["Model"] = gdf["Vehicle Model"].astype(str).str.strip().str.split().str[0].str.upper()
 
-            # Parse invoice date for Month
             raw_date = gdf["Invoice Date"].astype(str).str.strip().str[:10]
             gdf["Invoice Date"] = pd.to_datetime(raw_date, format="%d-%m-%Y", errors="coerce")
             mask = gdf["Invoice Date"].isna()
@@ -1017,12 +926,11 @@ def one_pager(
                 else:
                     gdf[col] = 0.0
 
-            # Only keep months NOT already in CY26 CSV (avoid duplicates)
-            gsheet_df = gdf[~gdf["Month"].isin(cy26_csv_months)].copy()
+            # Only keep months NOT already in CY26 CSV to avoid duplicates
+            gsheet_df = gdf[~gdf["Month"].isin(CY26_CSV_MONTHS)].copy()
         except Exception:
-            gsheet_df = None  # silently fall back to CSV only
+            gsheet_df = None
 
-    # ── Build data ──────────────────────────────────────────────────────────
     data = df.copy()
     if gsheet_df is not None and len(gsheet_df):
         data = pd.concat([data, gsheet_df], ignore_index=True)
@@ -1036,16 +944,6 @@ def one_pager(
     if model:    data = data[data["Model"].isin(model)]
 
     divisions = sorted(data["Division"].dropna().unique().tolist())
-
-    # Service Type category mapping (adjust keywords to match your actual data)
-    def is_pdi(st):         return str(st).strip().upper().startswith("PDI")
-    def is_acc(st):         return str(st).strip().upper().startswith("ACC") or "ACCESSORIES" in str(st).upper()
-    def is_1fs(st):         return str(st).strip().upper() in ["1FS","1 FS","1FREE","1 FREE SERVICE","1FS"]
-    def is_2fs(st):         return str(st).strip().upper() in ["2FS","2 FS","2FREE","2 FREE SERVICE","2FS"]
-    def is_3fs(st):         return str(st).strip().upper() in ["3FS","3 FS","3FREE","3 FREE SERVICE","3FS"]
-    def is_ps(st):          return str(st).strip().upper() in ["PS","PAID SERVICE","PAID SERVICES","PM","PAID MAINTENANCE","PAID MAINT"]
-    def is_rr(st):          return str(st).strip().upper() in ["RR","RUNNING REPAIR","RR"]
-    def is_bp(st):          return str(st).strip().upper() in ["B&P","BP","BODY & PAINT","BODY AND PAINT","BODYSHOP","BODY SHOP"]
 
     def cat(row):
         st = str(row.get("Service Type","")).strip().upper()
@@ -1064,11 +962,8 @@ def one_pager(
 
     result = []
     ALL = "__ALL__"
-    div_list = divisions + [ALL]
-
-    for div in div_list:
+    for div in divisions + [ALL]:
         d = data if div == ALL else data[data["Division"] == div]
-
         pdi  = d[d["_cat"] == "PDI"]
         acc  = d[d["_cat"] == "ACC"]
         fs1  = d[d["_cat"] == "1FS"]
@@ -1077,42 +972,34 @@ def one_pager(
         ps   = d[d["_cat"] == "PS"]
         rr   = d[d["_cat"] == "RR"]
         bp   = d[d["_cat"] == "BP"]
-
         mech = d[d["_cat"].isin(["1FS","2FS","3FS","PS","RR"])]
         mech_ro  = int(mech["Repair Order#"].nunique())
         bp_ro    = int(bp["Repair Order#"].nunique())
         pdi_ro   = int(pdi["Repair Order#"].nunique())
         acc_ro   = int(acc["Repair Order#"].nunique())
         total_ro = mech_ro + bp_ro
-
-        # Labour: separate Bodyshop labour from service labour
-        # Bodyshop = BP category; Service = everything else
-        service_labour = float(mech["Net Taxable Labor Amount"].sum()) +                          float(ps["Net Taxable Labor Amount"].sum()) +                          float(rr["Net Taxable Labor Amount"].sum()) +                          float(fs1["Net Taxable Labor Amount"].sum()) +                          float(fs2["Net Taxable Labor Amount"].sum()) +                          float(fs3["Net Taxable Labor Amount"].sum())
-        service_labour = float(mech["Net Taxable Labor Amount"].sum())
+        service_labour  = float(mech["Net Taxable Labor Amount"].sum())
         bodyshop_labour = float(bp["Net Taxable Labor Amount"].sum())
-
         mech_parts = float(mech["Net Taxable Parts Amt"].sum())
         bp_parts   = float(bp["Net Taxable Parts Amt"].sum())
-
         def safe_div(a, b): return round(a/b, 2) if b else 0
-
         result.append({
-            "division":         div if div != ALL else "TOTAL",
-            "pdi_ro":           pdi_ro,
-            "acc_ro":           acc_ro,
-            "total_billed_ro":  total_ro + pdi_ro + acc_ro,
-            "fs1_ro":           int(fs1["Repair Order#"].nunique()),
-            "fs2_ro":           int(fs2["Repair Order#"].nunique()),
-            "fs3_ro":           int(fs3["Repair Order#"].nunique()),
-            "ps_ro":            int(ps["Repair Order#"].nunique()),
-            "rr_ro":            int(rr["Repair Order#"].nunique()),
-            "mech_ro":          mech_ro,
-            "bp_ro":            bp_ro,
-            "total_ro":         total_ro,
-            "service_labour":   service_labour,
-            "bodyshop_labour":  bodyshop_labour,
-            "mech_parts":       mech_parts,
-            "bp_parts":         bp_parts,
+            "division":          div if div != ALL else "TOTAL",
+            "pdi_ro":            pdi_ro,
+            "acc_ro":            acc_ro,
+            "total_billed_ro":   total_ro + pdi_ro + acc_ro,
+            "fs1_ro":            int(fs1["Repair Order#"].nunique()),
+            "fs2_ro":            int(fs2["Repair Order#"].nunique()),
+            "fs3_ro":            int(fs3["Repair Order#"].nunique()),
+            "ps_ro":             int(ps["Repair Order#"].nunique()),
+            "rr_ro":             int(rr["Repair Order#"].nunique()),
+            "mech_ro":           mech_ro,
+            "bp_ro":             bp_ro,
+            "total_ro":          total_ro,
+            "service_labour":    service_labour,
+            "bodyshop_labour":   bodyshop_labour,
+            "mech_parts":        mech_parts,
+            "bp_parts":          bp_parts,
             "mech_parts_per_ro": safe_div(mech_parts, mech_ro),
             "mech_labour_per_ro":safe_div(service_labour, mech_ro),
             "bp_parts_per_ro":   safe_div(bp_parts, bp_ro),
@@ -1121,9 +1008,7 @@ def one_pager(
 
     return {"divisions": divisions, "rows": result}
 
-
-
-# ---------------- CM.JS (Current Month JS served separately) ----------------
+# ---------------- CM.JS ----------------
 
 CM_JS = r"""
 var _GSHEET_CSV = "__GSHEET_URL__";
@@ -1172,7 +1057,6 @@ async function _loadCurrentMonth() {
     msg2.innerHTML = "<td colspan=8 class=empty-msg>Loading MTD comparison...</td>";
     tbody.innerHTML = ""; tbody.appendChild(msg2);
 
-    // Step 2: call backend with GSheet max day
     var params = buildCmParams();
     if (gsheetMaxDay) params += (params ? "&" : "") + "mtd_day=" + gsheetMaxDay;
 
@@ -1231,12 +1115,9 @@ async function _loadCurrentMonth() {
         var rows = data.rows || [];
         var mtdDayLimit = (data.mtd && data.mtd.mtd_day) ? data.mtd.mtd_day : (gsheetMaxDay || 31);
 
-        // ── Division summary table (CY25 MTD vs CY26 MTD comparison) ──
-        // Use backend-computed division breakdown (full GSheet, filtered to MTD day)
         var divCy25 = data.div_cy25 || {};
         var divCy26 = data.div_cy26 || {};
 
-        // Fallback: compute from rows if backend didn't provide div_cy26
         if (Object.keys(divCy26).length === 0) {
             var mtdRows = rows.filter(function(r) {
                 var d = (r["Invoice Date"] || "").split(" ")[0];
@@ -1267,7 +1148,6 @@ async function _loadCurrentMonth() {
         function fi(v) { return Math.round(v||0).toLocaleString("en-IN"); }
         function fc(v) { return "₹ " + Math.round(v||0).toLocaleString("en-IN"); }
 
-        // All divisions — union of CY25 and CY26
         var allDivs = new Set(Object.keys(divCy25).concat(Object.keys(divCy26)));
         var divHtml = "";
         var gI25=0,gI26=0,gL25=0,gL26=0,gS25=0,gS26=0;
@@ -1287,7 +1167,6 @@ async function _loadCurrentMonth() {
                 "<td>" + fc(l25+s25) + "</td><td style=color:#15803d;font-weight:600>" + fc(l26+s26) + "</td><td>" + gpBadge(l25+s25,l26+s26) + "</td>" +
                 "</tr>";
         });
-        // Total row
         divHtml += "<tr style=background:#eef1ff;font-weight:700;border-top:2px solid #4f6bdc>" +
             "<td style=text-align:left>TOTAL</td>" +
             "<td>" + fi(gI25) + "</td><td style=color:#15803d>" + fi(gI26) + "</td><td>" + gpBadge(gI25,gI26) + "</td>" +
@@ -1331,9 +1210,7 @@ async function _loadCurrentMonth() {
 def cm_js():
     return FResponse(content=CM_JS, media_type="application/javascript")
 
-# ---------------- CURRENT MONTH (Google Sheet) ----------------
-
-# GSHEET_CSV is defined at top via env var
+# ---------------- CURRENT MONTH (April from Google Sheet) ----------------
 
 @app.get("/current-month")
 def current_month(
@@ -1341,8 +1218,9 @@ def current_month(
     service:  list[str] = Query(None),
     sa:       list[str] = Query(None),
     model:    list[str] = Query(None),
-    mtd_day:  int = None,   # passed by browser after reading GSheet max date
+    mtd_day:  int = None,
 ):
+    # Current month is APRIL 2026 — comes exclusively from Google Sheet
     try:
         import requests as req
         resp = req.get(GSHEET_CSV, timeout=5)
@@ -1352,26 +1230,29 @@ def current_month(
         gdf = pd.read_csv(raw, low_memory=False)
         gdf.columns = gdf.columns.str.strip()
     except Exception as e:
-        return {"error": "Google Sheet unavailable: " + str(e), "rows": [], "summary": {}, "mtd": None, "div_cy25": {}, "div_cy26": {}, "month": "Current Month"}
+        return {
+            "error": "Google Sheet unavailable: " + str(e),
+            "rows": [], "summary": {}, "mtd": None,
+            "div_cy25": {}, "div_cy26": {},
+            "month": CURRENT_MONTH_LABEL
+        }
 
-    # Normalise columns to match existing CSV schema
     col_map = {}
     for c in gdf.columns:
         cl = c.strip().lower()
-        if "invoice date" in cl:              col_map[c] = "Invoice Date"
+        if "invoice date" in cl:                               col_map[c] = "Invoice Date"
         elif "repair order#" in cl or "repair order #" in cl: col_map[c] = "Repair Order#"
-        elif "repair order date" in cl:       col_map[c] = "Repair Order Date"
-        elif "vehicle model" in cl:           col_map[c] = "Vehicle Model"
-        elif "vehicle reg" in cl:             col_map[c] = "Vehicle Reg#"
-        elif "service type" in cl:            col_map[c] = "Service Type"
-        elif "invoice type" in cl:            col_map[c] = "Invoice Type"
-        elif "ro owner first" in cl:          col_map[c] = "RO Owner First Name"
-        elif "ro owner last" in cl:           col_map[c] = "RO Owner Last Name"
-        elif "net taxable labor" in cl:       col_map[c] = "Net Taxable Labor Amount"
-        elif "net taxable parts" in cl:       col_map[c] = "Net Taxable Parts Amt"
+        elif "repair order date" in cl:                        col_map[c] = "Repair Order Date"
+        elif "vehicle model" in cl:                            col_map[c] = "Vehicle Model"
+        elif "vehicle reg" in cl:                              col_map[c] = "Vehicle Reg#"
+        elif "service type" in cl:                             col_map[c] = "Service Type"
+        elif "invoice type" in cl:                             col_map[c] = "Invoice Type"
+        elif "ro owner first" in cl:                           col_map[c] = "RO Owner First Name"
+        elif "ro owner last" in cl:                            col_map[c] = "RO Owner Last Name"
+        elif "net taxable labor" in cl:                        col_map[c] = "Net Taxable Labor Amount"
+        elif "net taxable parts" in cl:                        col_map[c] = "Net Taxable Parts Amt"
     gdf = gdf.rename(columns=col_map)
 
-    # Derived columns
     if "Repair Order#" in gdf.columns:
         _raw_div = gdf["Repair Order#"].astype(str).str[2:6]
         gdf["Division"] = _raw_div.map(BRANCH_CODE_TO_NAME).fillna(_raw_div)
@@ -1392,15 +1273,10 @@ def current_month(
         else:
             gdf[col] = 0.0
 
-    # Apply filters
-    if division and "Division" in gdf.columns:
-        gdf = gdf[gdf["Division"].isin(division)]
-    if service and "Service Type" in gdf.columns:
-        gdf = gdf[gdf["Service Type"].isin(service)]
-    if sa and "SA Name" in gdf.columns:
-        gdf = gdf[gdf["SA Name"].isin(sa)]
-    if model and "Model" in gdf.columns:
-        gdf = gdf[gdf["Model"].isin(model)]
+    if division and "Division" in gdf.columns:     gdf = gdf[gdf["Division"].isin(division)]
+    if service  and "Service Type" in gdf.columns: gdf = gdf[gdf["Service Type"].isin(service)]
+    if sa       and "SA Name" in gdf.columns:      gdf = gdf[gdf["SA Name"].isin(sa)]
+    if model    and "Model" in gdf.columns:        gdf = gdf[gdf["Model"].isin(model)]
 
     labour = float(gdf["Net Taxable Labor Amount"].sum())
     spares = float(gdf["Net Taxable Parts Amt"].sum())
@@ -1411,17 +1287,13 @@ def current_month(
     rows_out = gdf[keep_cols].head(500).copy()
     rows_out["Total Revenue"] = rows_out.get("Net Taxable Labor Amount", 0) + rows_out.get("Net Taxable Parts Amt", 0)
 
-    # ---- MTD comparison: use GSheet latest date supplied by browser ----
+    # MTD comparison: April CY26 (GSheet) vs April CY25 (CSV)
     from datetime import datetime
     today = datetime.now()
-    curr_month_name = today.strftime("%b")       # e.g. "Mar"
-    curr_year       = today.year                 # 2026
-    # mtd_day supplied by browser (max date in GSheet) — fall back to today if missing
     if not mtd_day:
         mtd_day = today.day
 
-    # CY26 current month rows (already in gdf if filter applied)
-    # For MTD we need unfiltered df too (compare same day range in CY25)
+    # CY25 April MTD from CSV (filtered same as request)
     base_df = df.copy()
     if division and "Division" in base_df.columns: base_df = base_df[base_df["Division"].isin(division)]
     if service  and "Service Type" in base_df.columns: base_df = base_df[base_df["Service Type"].isin(service)]
@@ -1430,7 +1302,7 @@ def current_month(
 
     cy25_mtd = base_df[
         (base_df["CY"] == "CY25") &
-        (base_df["Month"] == curr_month_name) &
+        (base_df["Month"] == CURRENT_MONTH_NAME) &
         (base_df["Invoice Date"].dt.day <= mtd_day)
     ]
     cy25_mtd_labour = float(cy25_mtd["Net Taxable Labor Amount"].sum())
@@ -1439,8 +1311,7 @@ def current_month(
 
     def pct(new, old): return round((new-old)/old*100, 1) if old else None
 
-    # CY26 MTD division breakdown — from full GSheet (not capped at 500 rows)
-    # Parse invoice date day for GSheet rows
+    # April CY26 MTD division breakdown from GSheet
     if "Invoice Date" in gdf.columns:
         raw_d = gdf["Invoice Date"].astype(str).str.strip().str[:10]
         gdf["_day"] = pd.to_numeric(raw_d.str.split("-").str[0], errors="coerce").fillna(0).astype(int)
@@ -1451,52 +1322,55 @@ def current_month(
 
     div_cy26 = {}
     if "Division" in gdf_mtd.columns:
-        for div, grp in gdf_mtd.groupby("Division"):
-            div_cy26[div] = {
+        for div_grp, grp in gdf_mtd.groupby("Division"):
+            div_cy26[div_grp] = {
                 "inflow":  int(grp["Repair Order#"].nunique()) if "Repair Order#" in grp.columns else 0,
                 "labour":  float(grp["Net Taxable Labor Amount"].sum()),
                 "spares":  float(grp["Net Taxable Parts Amt"].sum()),
             }
 
-    # Division-level CY25 MTD breakdown
+    # April CY25 MTD division breakdown
     div_cy25 = {}
-    for div, grp in cy25_mtd.groupby("Division"):
-        div_cy25[div] = {
+    for div_grp, grp in cy25_mtd.groupby("Division"):
+        div_cy25[div_grp] = {
             "inflow":  int(grp["Repair Order#"].nunique()),
             "labour":  float(grp["Net Taxable Labor Amount"].sum()),
             "spares":  float(grp["Net Taxable Parts Amt"].sum()),
         }
 
+    cy26_inflow = int(gdf["Repair Order#"].nunique()) if "Repair Order#" in gdf.columns else 0
+
     return {
         "rows": rows_out.to_dict(orient="records"),
         "summary": {
-            "inflow":  int(gdf["Repair Order#"].nunique()) if "Repair Order#" in gdf.columns else 0,
+            "inflow":  cy26_inflow,
             "labour":  indian_format(labour),
             "spares":  indian_format(spares),
             "total":   indian_format(labour + spares),
         },
         "mtd": {
-            "label":         f"{curr_month_name} 2026 (1-{mtd_day})",
-            "cy26_inflow":   int(gdf["Repair Order#"].nunique()) if "Repair Order#" in gdf.columns else 0,
-            "cy25_inflow":   cy25_mtd_inflow,
-            "inflow_pct":    pct(int(gdf["Repair Order#"].nunique()) if "Repair Order#" in gdf.columns else 0, cy25_mtd_inflow),
-            "cy26_labour":   indian_format(labour),
-            "cy25_labour":   indian_format(cy25_mtd_labour),
-            "labour_pct":    pct(labour, cy25_mtd_labour),
-            "cy26_spares":   indian_format(spares),
-            "cy25_spares":   indian_format(cy25_mtd_spares),
-            "spares_pct":    pct(spares, cy25_mtd_spares),
-            "cy26_total":    indian_format(labour + spares),
-            "cy25_total":    indian_format(cy25_mtd_labour + cy25_mtd_spares),
-            "total_pct":     pct(labour + spares, cy25_mtd_labour + cy25_mtd_spares),
-            "mtd_day":       mtd_day,
+            "label":        f"{CURRENT_MONTH_NAME} 2026 (1-{mtd_day})",
+            "cy26_inflow":  cy26_inflow,
+            "cy25_inflow":  cy25_mtd_inflow,
+            "inflow_pct":   pct(cy26_inflow, cy25_mtd_inflow),
+            "cy26_labour":  indian_format(labour),
+            "cy25_labour":  indian_format(cy25_mtd_labour),
+            "labour_pct":   pct(labour, cy25_mtd_labour),
+            "cy26_spares":  indian_format(spares),
+            "cy25_spares":  indian_format(cy25_mtd_spares),
+            "spares_pct":   pct(spares, cy25_mtd_spares),
+            "cy26_total":   indian_format(labour + spares),
+            "cy25_total":   indian_format(cy25_mtd_labour + cy25_mtd_spares),
+            "total_pct":    pct(labour + spares, cy25_mtd_labour + cy25_mtd_spares),
+            "mtd_day":      mtd_day,
         },
-        "div_cy25": div_cy25,
-        "div_cy26": div_cy26,
-        "mtd_label": f"Mar 2026 (1-{mtd_day}) vs CY25 Same Period",
-        "month": f"March {curr_year}",
+        "div_cy25":  div_cy25,
+        "div_cy26":  div_cy26,
+        "mtd_label": f"{CURRENT_MONTH_NAME} 2026 (1-{mtd_day}) vs CY25 Same Period",
+        "month":     CURRENT_MONTH_LABEL,
     }
 
+# ---------------- DASHBOARD HTML ----------------
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -1505,7 +1379,7 @@ def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Renault Service Revenue Dashboard v6</title>
+<title>Renault Service Revenue Dashboard v7</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1555,6 +1429,18 @@ body {
 .tab-btn:hover { color: #4f6bdc; background: #f4f6ff; }
 .tab-btn.active { color: #4f6bdc; border-bottom-color: #4f6bdc; background: #f4f6ff; }
 
+/* CURRENT MONTH tab badge */
+.tab-btn.live-tab { position: relative; }
+.tab-btn.live-tab::after {
+    content: '';
+    position: absolute;
+    top: 8px; right: 8px;
+    width: 7px; height: 7px;
+    background: #17a34a;
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+}
+
 .tab-page { display: none; }
 .tab-page.active { display: block; }
 
@@ -1580,12 +1466,12 @@ body {
     font-size: 11px; font-weight: 700; color: #555;
     text-transform: uppercase; letter-spacing: .5px;
 }
-.fg select#cy {
+.fg select#cy, .fg select#op-cy {
     width: 100%; padding: 7px 10px; border: 1px solid #ccc; border-radius: 6px;
     font-size: 13px; background: #fff; cursor: pointer; color: #333;
     appearance: auto; height: 34px;
 }
-.fg select#cy:focus { outline: 2px solid #4f6bdc; border-color: transparent; }
+.fg select#cy:focus, .fg select#op-cy:focus { outline: 2px solid #4f6bdc; border-color: transparent; }
 
 /* ---------- CUSTOM MULTI-SELECT ---------- */
 .custom-select { position: relative; width: 100%; }
@@ -1618,28 +1504,16 @@ body {
 .cs-item.checked { background: #eef1ff; font-weight: 600; }
 .cs-footer { border-top: 1px solid #eee; padding: 5px 10px; display: flex; justify-content: flex-end; flex-shrink: 0; }
 .cs-clear { font-size: 11px; color: #4f6bdc; cursor: pointer; text-decoration: underline; }
-/* Select All / Deselect All bar */
 .cs-sel-all {
-    display: flex;
-    gap: 6px;
-    padding: 6px 8px;
-    border-bottom: 1px solid #eee;
-    flex-shrink: 0;
+    display: flex; gap: 6px; padding: 6px 8px;
+    border-bottom: 1px solid #eee; flex-shrink: 0;
 }
 .cs-sa-btn {
-    flex: 1;
-    padding: 4px 0;
-    font-size: 11px;
-    font-weight: 600;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #f4f6ff;
-    color: #4f6bdc;
-    cursor: pointer;
-    white-space: nowrap;
+    flex: 1; padding: 4px 0; font-size: 11px; font-weight: 600;
+    border: 1px solid #ccc; border-radius: 4px; background: #f4f6ff;
+    color: #4f6bdc; cursor: pointer; white-space: nowrap;
 }
 .cs-sa-btn:hover { background: #4f6bdc; color: #fff; border-color: #4f6bdc; }
-
 
 /* ---------- BUTTONS ---------- */
 .apply-btn {
@@ -1656,22 +1530,13 @@ body {
 .export-btn:hover { background: #15803d; }
 .export-btn:disabled { background: #86c9a3; cursor: not-allowed; }
 .reset-btn {
-    padding: 0 18px;
-    height: 34px;
-    background: #fff;
-    color: #ef4444;
-    border: 1.5px solid #ef4444;
-    border-radius: 6px;
-    font-size: 14px;
-    font-weight: 700;
-    cursor: pointer;
-    align-self: flex-end;
-    white-space: nowrap;
+    padding: 0 18px; height: 34px; background: #fff; color: #ef4444;
+    border: 1.5px solid #ef4444; border-radius: 6px; font-size: 14px; font-weight: 700;
+    cursor: pointer; align-self: flex-end; white-space: nowrap;
 }
 .reset-btn:hover { background: #ef4444; color: #fff; }
 
-
-/* ---------- TABLE (Page 1) ---------- */
+/* ---------- TABLE ---------- */
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead tr { background: #4f6bdc; color: #fff; }
@@ -1680,7 +1545,7 @@ td { padding: 8px 12px; border-bottom: 1px solid #eee; white-space: nowrap; }
 tbody tr:hover { background: #f4f6ff; }
 .empty-msg { text-align: center; color: #999; padding: 24px; }
 
-/* ---------- COMPARISON TABLE (Page 2) ---------- */
+/* ---------- COMPARISON TABLE ---------- */
 .comp-section { margin-bottom: 36px; }
 .comp-section h3 {
     font-size: 15px; font-weight: 700; color: #4f6bdc;
@@ -1705,7 +1570,7 @@ tbody tr:hover { background: #f4f6ff; }
 
 .comp-loading { text-align: center; color: #999; padding: 40px; font-size: 14px; }
 
-/* ---------- DIVISION-MONTH PIVOT TABLE (Page 3) ---------- */
+/* ---------- PIVOT TABLE ---------- */
 .pivot-wrap { overflow-x: auto; margin-bottom: 36px; }
 .pivot-section h3 {
     font-size: 15px; font-weight: 700; color: #4f6bdc;
@@ -1723,13 +1588,9 @@ tbody tr:hover { background: #f4f6ff; }
     padding: 4px 6px; font-size: 10px; text-align: center;
     border: 1px solid #3a56c5; white-space: nowrap;
 }
-/* CY24 sub-header */
 .pivot-table thead tr:nth-child(2) th:nth-child(3n+1) { background: #5a7ae8; color:#fff; }
-/* CY25 sub-header */
 .pivot-table thead tr:nth-child(2) th:nth-child(3n+2) { background: #4f6bdc; color:#fff; }
-/* Growth% sub-header */
 .pivot-table thead tr:nth-child(2) th:nth-child(3n)   { background: #2e4baa; color:#fff; }
-
 .pivot-table td {
     padding: 6px 8px; border: 1px solid #e5e7eb;
     text-align: right; white-space: nowrap; font-size: 11px;
@@ -1747,7 +1608,8 @@ tbody tr:hover { background: #f4f6ff; }
     padding: 7px 8px; text-align: right;
 }
 .pivot-table tfoot td:first-child { text-align: left; position: sticky; left: 0; }
-/* ---------- ONE PAGER TABLE (Page 4) ---------- */
+
+/* ---------- ONE PAGER TABLE ---------- */
 .op-wrap { overflow-x: auto; margin-top: 8px; }
 .op-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .op-table th {
@@ -1759,7 +1621,6 @@ tbody tr:hover { background: #f4f6ff; }
 .op-table th.div-hdr  { min-width: 80px; }
 .op-table th.total-hdr{ background: #1e3a8a; }
 .op-table th.avg-hdr  { background: #1e3a8a; }
-
 .op-table td {
     padding: 8px 12px; border: 1px solid #e5e7eb;
     text-align: right; white-space: nowrap; font-size: 12px;
@@ -1785,209 +1646,69 @@ tbody tr:hover { background: #f4f6ff; }
     text-transform: uppercase; letter-spacing: .4px;
 }
 
-
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%       { opacity: .4; transform: scale(1.3); }
 }
 
-/* ============================================================
-   RESPONSIVE — Mobile / Tablet / Laptop / Desktop
-   Breakpoints:
-     xs  mobile portrait  : < 480px
-     sm  mobile landscape : 480–767px
-     md  tablet           : 768–1023px
-     lg  laptop           : 1024–1279px
-     xl  desktop          : 1280px+
-   ============================================================ */
-
-/* ── Base: body padding shrinks on small screens ── */
+/* ── RESPONSIVE ── */
 @media (max-width: 767px) {
   body { padding: 0; background: #f0f2ff; }
   .container { border-radius: 0; padding: 14px 12px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  body { padding: 12px; }
-  .container { padding: 20px 18px; }
-}
-
-/* ── HEADER ── */
-@media (max-width: 767px) {
   .header { flex-direction: column; align-items: flex-start; gap: 6px; margin-bottom: 14px; }
   .header h2 { font-size: 17px; line-height: 1.3; }
-}
-
-/* ── TABS — horizontal scroll on small screens ── */
-@media (max-width: 767px) {
-  .tabs {
-    flex-wrap: nowrap;
-    gap: 0;
-    margin-bottom: 0;
-  }
+  .tabs { flex-wrap: nowrap; gap: 0; margin-bottom: 0; }
   .tabs-wrap { margin-bottom: 16px; }
   .tab-scroll-hint { display: flex; }
-  .tab-btn {
-    padding: 9px 14px;
-    font-size: 12px;
-    white-space: nowrap;
-    flex-shrink: 0;
-    border-radius: 0;
-  }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .tabs { flex-wrap: wrap; gap: 2px; }
-  .tab-btn { padding: 8px 14px; font-size: 13px; }
-}
-
-/* ── CARDS ── */
-@media (max-width: 479px) {
+  .tab-btn { padding: 9px 14px; font-size: 12px; white-space: nowrap; flex-shrink: 0; border-radius: 0; }
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .card { padding: 12px 10px; }
   .card .value { font-size: 16px; }
   .card .label { font-size: 10px; margin-bottom: 5px; }
-}
-@media (min-width: 480px) and (max-width: 767px) {
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .card { padding: 12px 10px; }
-  .card .value { font-size: 15px; }
-  .card .label { font-size: 10px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .card .value { font-size: 18px; }
-}
-
-/* ── FILTER BAR ── */
-@media (max-width: 479px) {
   .filter-bar { padding: 12px 10px; gap: 10px; }
   .fg { min-width: calc(50% - 5px); flex: none; }
   .fg label { font-size: 10px; }
-  .fg select#cy { font-size: 12px; height: 32px; }
   .cs-face { font-size: 12px; height: 32px; }
-  .apply-btn, .export-btn, .reset-btn {
-    height: 32px; font-size: 12px;
-    padding: 0 12px; flex: 1;
-  }
+  .apply-btn, .export-btn, .reset-btn { height: 32px; font-size: 12px; padding: 0 12px; flex: 1; }
+  .table-wrap, .op-wrap, .pivot-wrap { border-radius: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table, .comp-table, .pivot-table, .op-table { font-size: 11px; min-width: 540px; }
+  th, td { padding: 7px 8px; }
+  .cs-panel { position: fixed; left: 8px !important; right: 8px !important; width: auto !important; top: auto !important; bottom: 0; border-radius: 12px 12px 0 0; max-height: 60vh; box-shadow: 0 -4px 24px rgba(0,0,0,.18); z-index: 9999; }
 }
 @media (min-width: 480px) and (max-width: 767px) {
-  .filter-bar { padding: 12px; gap: 10px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .card .value { font-size: 15px; }
+  .card .label { font-size: 10px; }
   .fg { min-width: calc(50% - 5px); flex: none; }
   .apply-btn, .export-btn, .reset-btn { height: 32px; font-size: 13px; }
 }
 @media (min-width: 768px) and (max-width: 1023px) {
+  body { padding: 12px; }
+  .container { padding: 20px 18px; }
+  .tabs { flex-wrap: wrap; gap: 2px; }
+  .tab-btn { padding: 8px 14px; font-size: 13px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .card .value { font-size: 18px; }
   .fg { min-width: 140px; }
-}
-
-/* Buttons row on mobile — full width row */
-@media (max-width: 479px) {
-  .filter-bar .apply-btn,
-  .filter-bar .export-btn,
-  .filter-bar .reset-btn {
-    width: 100%;
-    flex: 1 1 calc(33% - 8px);
-    min-width: 80px;
-  }
-}
-
-/* ── TABLES — horizontal scroll + smaller text ── */
-@media (max-width: 767px) {
-  .table-wrap, .op-wrap, .pivot-wrap { border-radius: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table, .comp-table, .pivot-table, .op-table { font-size: 11px; min-width: 540px; }
-  th, td { padding: 7px 8px; }
-  .comp-table th, .comp-table td { padding: 7px 8px; }
-}
-@media (min-width: 768px) and (max-width: 1023px) {
   table, .comp-table, .pivot-table, .op-table { font-size: 12px; }
   th, td { padding: 8px 10px; }
 }
-
-/* ── COMPARISON SECTION HEADINGS ── */
-@media (max-width: 767px) {
-  .comp-section h3 { font-size: 13px; }
-  .pivot-section h3 { font-size: 13px; }
+@media (hover: none) and (pointer: coarse) {
+  .tab-btn { min-height: 42px; }
+  .cs-item { min-height: 38px; padding: 8px 12px; }
+  .cs-sa-btn { min-height: 34px; }
+  .apply-btn, .export-btn, .reset-btn { min-height: 38px; }
 }
-
-/* ── PCT BADGES — smaller on mobile ── */
-@media (max-width: 767px) {
-  .pct, .pct-up, .pct-down, .pct-flat { font-size: 10px; padding: 1px 5px; }
-}
-
-/* ── ONE PAGER TABLE ── */
-@media (max-width: 767px) {
-  .op-table th.desc-hdr { min-width: 140px; }
-  .op-table th.div-hdr  { min-width: 60px; }
-  .op-table th, .op-table td { padding: 6px 8px; font-size: 10px; }
-}
-
-/* ── CURRENT MONTH cards stack on mobile ── */
-@media (max-width: 479px) {
-  #page5 .cards { grid-template-columns: 1fr 1fr; }
-}
-@media (min-width: 480px) and (max-width: 767px) {
-  #page5 .cards { grid-template-columns: repeat(3, 1fr); }
-}
-
-/* ── LIVE BADGE row wraps ── */
-@media (max-width: 479px) {
-  #page5 > div[style*="display:flex"] {
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-}
-
-/* ── Division summary table on Page 5 — very wide, always scroll ── */
 @media (max-width: 1279px) {
   #cm-div-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   #cm-div-wrap table { min-width: 900px; }
 }
-@media (max-width: 767px) {
-  #cm-div-wrap table { font-size: 10px; }
-  #cm-div-wrap th, #cm-div-wrap td { padding: 5px 6px; }
-  #cm-mtd-wrap table { min-width: 320px; font-size: 11px; }
-}
-
-/* ── Container max-width steps ── */
-@media (min-width: 1280px)  { .container { max-width: 1400px; } }
-@media (min-width: 1024px) and (max-width: 1279px) { .container { max-width: 1200px; } }
-@media (min-width: 768px)  and (max-width: 1023px) { .container { max-width: 960px;  } }
-
-/* ── Sticky first-column on pivot/op tables ── */
-@media (max-width: 767px) {
-  .pivot-table td:first-child,
-  .op-table td.desc-cell { min-width: 90px; font-size: 10px; }
-}
-
-/* ── Touch-friendly tap targets ── */
-@media (hover: none) and (pointer: coarse) {
-  .tab-btn   { min-height: 42px; }
-  .cs-item   { min-height: 38px; padding: 8px 12px; }
-  .cs-sa-btn { min-height: 34px; }
-  .apply-btn, .export-btn, .reset-btn { min-height: 38px; }
-}
-
-/* ── cs-panel: fix dropdown going off-screen on mobile ── */
-@media (max-width: 767px) {
-  .cs-panel {
-    position: fixed;
-    left: 8px !important;
-    right: 8px !important;
-    width: auto !important;
-    top: auto !important;
-    bottom: 0;
-    border-radius: 12px 12px 0 0;
-    max-height: 60vh;
-    box-shadow: 0 -4px 24px rgba(0,0,0,.18);
-    z-index: 9999;
-  }
-}
-
 </style>
 </head>
 
 <body>
 <div class="container">
 
-  <!-- HEADER -->
   <div class="header">
     <h2>Renault Service Revenue Dashboard</h2>
   </div>
@@ -1995,20 +1716,18 @@ tbody tr:hover { background: #f4f6ff; }
   <!-- TABS -->
   <div class="tabs-wrap">
     <div class="tabs" id="tabsEl">
-      <button class="tab-btn active" onclick="switchTab('page1', this)">Invoice Data</button>
-      <button class="tab-btn"        onclick="switchTab('page2', this)">CY Comparison</button>
-      <button class="tab-btn"        onclick="switchTab('page3', this)">Division-Month</button>
-      <button class="tab-btn"        onclick="switchTab('page4', this)">One Pager Report</button>
-      <button class="tab-btn"        onclick="switchTab('page5', this)">Current Month (Mar)</button>
-      <button class="tab-btn"        onclick="switchTab('page6', this)">Division-Month CY26</button>
+      <button class="tab-btn active"  onclick="switchTab('page1', this)">Invoice Data</button>
+      <button class="tab-btn"         onclick="switchTab('page2', this)">CY Comparison</button>
+      <button class="tab-btn"         onclick="switchTab('page3', this)">Division-Month</button>
+      <button class="tab-btn"         onclick="switchTab('page4', this)">One Pager Report</button>
+      <button class="tab-btn live-tab" onclick="switchTab('page5', this)">Current Month (Apr)</button>
+      <button class="tab-btn"         onclick="switchTab('page6', this)">Division-Month CY26</button>
     </div>
     <div class="tab-scroll-hint" id="tabScrollHint">&#8250;</div>
   </div>
 
   <!-- ==================== PAGE 1 ==================== -->
   <div id="page1" class="tab-page active">
-
-    <!-- CARDS -->
     <div class="cards">
       <div class="card"><div class="label">Inflow CY24</div><div class="value" id="inflow24">…</div></div>
       <div class="card"><div class="label">Inflow CY25</div><div class="value" id="inflow25">…</div></div>
@@ -2017,8 +1736,6 @@ tbody tr:hover { background: #f4f6ff; }
       <div class="card"><div class="label">Total Spares</div><div class="value" id="spares">…</div></div>
       <div class="card" style="border: 2px solid #4f6bdc;"><div class="label">Total Revenue</div><div class="value" id="total-rev">…</div></div>
     </div>
-
-    <!-- FILTER BAR -->
     <div class="filter-bar">
       <div class="fg">
         <label>Calendar Year</label>
@@ -2029,124 +1746,63 @@ tbody tr:hover { background: #f4f6ff; }
           <option value="CY26">CY26</option>
         </select>
       </div>
-      <div class="fg"><label>Division</label>
-        <div class="custom-select" id="cs-division" data-key="division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg"><label>Service Type</label>
-        <div class="custom-select" id="cs-service" data-key="service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg"><label>SA Name</label>
-        <div class="custom-select" id="cs-sa" data-key="sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg"><label>Invoice Type</label>
-        <div class="custom-select" id="cs-invoice" data-key="invoice" data-placeholder="All Invoice Types"></div>
-      </div>
-      <div class="fg"><label>Model</label>
-        <div class="custom-select" id="cs-model" data-key="model" data-placeholder="All Models"></div>
-      </div>
-      <div class="fg"><label>Month</label>
-        <div class="custom-select" id="cs-month" data-key="month" data-placeholder="All Months"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs-division" data-key="division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs-service" data-key="service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs-sa" data-key="sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs-invoice" data-key="invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs-model" data-key="model" data-placeholder="All Models"></div></div>
+      <div class="fg"><label>Month</label><div class="custom-select" id="cs-month" data-key="month" data-placeholder="All Months"></div></div>
       <button class="apply-btn"  onclick="applyFilters()">Apply</button>
       <button class="export-btn" onclick="exportExcel()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage1()">Reset</button>
     </div>
-
-    <!-- TABLE -->
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Division</th><th>RO #</th><th>SA Name</th>
             <th>Vehicle</th><th>Service Type</th>
-            <th>Labour (₹)</th><th>Spares (₹)</th>
-            <th style="background:#3a56c5;">Total Revenue (₹)</th>
+            <th>Labour (&#8377;)</th><th>Spares (&#8377;)</th>
+            <th style="background:#3a56c5;">Total Revenue (&#8377;)</th>
           </tr>
         </thead>
-        <tbody id="tbody">
-          <tr><td colspan="8" class="empty-msg">Loading…</td></tr>
-        </tbody>
+        <tbody id="tbody"><tr><td colspan="8" class="empty-msg">Loading&#8230;</td></tr></tbody>
       </table>
     </div>
-
   </div><!-- /page1 -->
 
   <!-- ==================== PAGE 2 ==================== -->
   <div id="page2" class="tab-page">
-
-    <!-- FILTER BAR (Comparison) -->
     <div class="filter-bar">
-      <div class="fg">
-        <label>Division</label>
-        <div class="custom-select" id="cs2-division" data-key="c-division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg">
-        <label>Service Type</label>
-        <div class="custom-select" id="cs2-service" data-key="c-service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg">
-        <label>SA Name</label>
-        <div class="custom-select" id="cs2-sa" data-key="c-sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg">
-        <label>Invoice Type</label>
-        <div class="custom-select" id="cs2-invoice" data-key="c-invoice" data-placeholder="All Invoice Types"></div>
-      </div>
-      <div class="fg">
-        <label>Model</label>
-        <div class="custom-select" id="cs2-model" data-key="c-model" data-placeholder="All Models"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs2-division" data-key="c-division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs2-service" data-key="c-service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs2-sa" data-key="c-sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs2-invoice" data-key="c-invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs2-model" data-key="c-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyComparison()">Apply</button>
       <button class="export-btn" id="export-btn-p2" onclick="exportPage2()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage2()">Reset</button>
     </div>
-
-    <div id="comp-content">
-      <div class="comp-loading">Click the tab to load comparison data…</div>
-    </div>
-
+    <div id="comp-content"><div class="comp-loading">Click the tab to load comparison data&#8230;</div></div>
   </div><!-- /page2 -->
 
   <!-- ==================== PAGE 3 ==================== -->
   <div id="page3" class="tab-page">
-
-    <!-- FILTER BAR (Division-Month) -->
     <div class="filter-bar">
-      <div class="fg">
-        <label>Division</label>
-        <div class="custom-select" id="cs3-division" data-key="d-division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg">
-        <label>Service Type</label>
-        <div class="custom-select" id="cs3-service" data-key="d-service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg">
-        <label>SA Name</label>
-        <div class="custom-select" id="cs3-sa" data-key="d-sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg">
-        <label>Invoice Type</label>
-        <div class="custom-select" id="cs3-invoice" data-key="d-invoice" data-placeholder="All Invoice Types"></div>
-      </div>
-      <div class="fg">
-        <label>Model</label>
-        <div class="custom-select" id="cs3-model" data-key="d-model" data-placeholder="All Models"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs3-division" data-key="d-division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs3-service" data-key="d-service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs3-sa" data-key="d-sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs3-invoice" data-key="d-invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs3-model" data-key="d-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyDivMonth()">Apply</button>
       <button class="export-btn" id="export-btn-p3" onclick="exportPage3()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage3()">Reset</button>
     </div>
-
-    <div id="divmonth-content">
-      <div class="comp-loading">Click the tab to load data…</div>
-    </div>
-
+    <div id="divmonth-content"><div class="comp-loading">Click the tab to load data&#8230;</div></div>
   </div><!-- /page3 -->
 
   <!-- ==================== PAGE 4 ==================== -->
   <div id="page4" class="tab-page">
-
-    <!-- FILTER BAR -->
     <div class="filter-bar">
       <div class="fg">
         <label>Calendar Year</label>
@@ -2157,52 +1813,26 @@ tbody tr:hover { background: #f4f6ff; }
           <option value="CY26">CY26</option>
         </select>
       </div>
-      <div class="fg"><label>Division</label>
-        <div class="custom-select" id="cs4-division" data-key="op-division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg"><label>Service Type</label>
-        <div class="custom-select" id="cs4-service" data-key="op-service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg"><label>SA Name</label>
-        <div class="custom-select" id="cs4-sa" data-key="op-sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg"><label>Invoice Type</label>
-        <div class="custom-select" id="cs4-invoice" data-key="op-invoice" data-placeholder="All Invoice Types"></div>
-      </div>
-      <div class="fg"><label>Model</label>
-        <div class="custom-select" id="cs4-model" data-key="op-model" data-placeholder="All Models"></div>
-      </div>
-      <div class="fg"><label>Month</label>
-        <div class="custom-select" id="cs4-month" data-key="op-month" data-placeholder="All Months"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs4-division" data-key="op-division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs4-service" data-key="op-service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs4-sa" data-key="op-sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs4-invoice" data-key="op-invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs4-model" data-key="op-model" data-placeholder="All Models"></div></div>
+      <div class="fg"><label>Month</label><div class="custom-select" id="cs4-month" data-key="op-month" data-placeholder="All Months"></div></div>
       <button class="apply-btn"  onclick="applyOnePager()">Apply</button>
       <button class="export-btn" id="export-btn-p4" onclick="exportPage4()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage4()">Reset</button>
     </div>
-
-    <div id="op-content">
-      <div class="comp-loading">Click the tab to load One Pager Report…</div>
-    </div>
-
+    <div id="op-content"><div class="comp-loading">Click the tab to load One Pager Report&#8230;</div></div>
   </div><!-- /page4 -->
 
-  <!-- ==================== PAGE 5 — CURRENT MONTH ==================== -->
+  <!-- ==================== PAGE 5 — CURRENT MONTH (APRIL — Google Sheet) ==================== -->
   <div id="page5" class="tab-page">
-
-    <!-- FILTER BAR -->
     <div class="filter-bar">
-      <div class="fg"><label>Division</label>
-        <div class="custom-select" id="cs5-division" data-key="cm-division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg"><label>Service Type</label>
-        <div class="custom-select" id="cs5-service" data-key="cm-service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg"><label>SA Name</label>
-        <div class="custom-select" id="cs5-sa" data-key="cm-sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg"><label>Model</label>
-        <div class="custom-select" id="cs5-model" data-key="cm-model" data-placeholder="All Models"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs5-division" data-key="cm-division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs5-service" data-key="cm-service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs5-sa" data-key="cm-sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs5-model" data-key="cm-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyCurrentMonth()">Apply</button>
       <button class="export-btn" id="export-btn-p5" onclick="exportPage5()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage5()">Reset</button>
@@ -2212,28 +1842,34 @@ tbody tr:hover { background: #f4f6ff; }
     <div class="cards" style="margin-bottom:20px;">
       <div class="card" style="border:2px solid #17a34a;">
         <div class="label">Current Month</div>
-        <div class="value" style="color:#17a34a;" id="cm-month-label">March 2026</div>
+        <div class="value" style="color:#17a34a;" id="cm-month-label">April 2026</div>
       </div>
-      <div class="card"><div class="label">Total Inflow</div><div class="value" id="cm-inflow">…</div></div>
-      <div class="card"><div class="label">Labour Revenue</div><div class="value" id="cm-labour">…</div></div>
-      <div class="card"><div class="label">Spares Revenue</div><div class="value" id="cm-spares">…</div></div>
-      <div class="card" style="border:2px solid #4f6bdc;"><div class="label">Total Revenue</div><div class="value" id="cm-total">…</div></div>
+      <div class="card"><div class="label">Total Inflow</div><div class="value" id="cm-inflow">&#8230;</div></div>
+      <div class="card"><div class="label">Labour Revenue</div><div class="value" id="cm-labour">&#8230;</div></div>
+      <div class="card"><div class="label">Spares Revenue</div><div class="value" id="cm-spares">&#8230;</div></div>
+      <div class="card" style="border:2px solid #4f6bdc;"><div class="label">Total Revenue</div><div class="value" id="cm-total">&#8230;</div></div>
     </div>
 
     <!-- LIVE BADGE -->
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
       <span style="display:inline-flex;align-items:center;gap:6px;background:#dcfce7;color:#15803d;padding:5px 14px;border-radius:20px;font-size:12px;font-weight:700;">
         <span style="width:8px;height:8px;background:#15803d;border-radius:50%;display:inline-block;animation:pulse 1.5s infinite;"></span>
-        LIVE — Google Sheets
+        LIVE &#8212; Google Sheets (April 2026)
       </span>
-      <button onclick="loadCurrentMonth()" style="background:none;border:1px solid #ccc;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;color:#555;">Refresh</button>
+      <button onclick="loadCurrentMonth()" style="background:none;border:1px solid #ccc;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;color:#555;">&#8635; Refresh</button>
       <span id="cm-last-updated" style="font-size:11px;color:#999;"></span>
+    </div>
+
+    <!-- Info note: March is in CSV, April is GSheet -->
+    <div style="background:#fefce8;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#92400e;">
+      &#8505;&#65039; <strong>March 2026</strong> data is fully loaded from the CY26 CSV file.
+      <strong>April 2026</strong> (current month) is live from Google Sheets.
     </div>
 
     <!-- MTD COMPARISON TABLE -->
     <div id="cm-mtd-wrap" style="margin-bottom:20px;overflow-x:auto;display:none;">
       <h3 style="font-size:14px;font-weight:700;color:#4f6bdc;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid #e5e7eb;">
-        MTD Comparison — <span id="cm-mtd-label">Current Month</span> vs Same Period Last Year (CY25)
+        MTD Comparison &#8212; <span id="cm-mtd-label">April 2026</span> vs April 2025 (CY25)
       </h3>
       <table class="comp-table" style="min-width:500px;">
         <thead>
@@ -2253,7 +1889,7 @@ tbody tr:hover { background: #f4f6ff; }
     <!-- DIVISION SUMMARY TABLE -->
     <div id="cm-div-wrap" style="margin-bottom:20px;overflow-x:auto;display:none;">
       <h3 style="font-size:14px;font-weight:700;color:#4f6bdc;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid #e5e7eb;">
-        Division-wise Summary — <span id="cm-div-month-label">Current Month</span>
+        Division-wise Summary &#8212; <span id="cm-div-month-label">April 2026</span>
       </h3>
       <table class="comp-table" style="min-width:900px;">
         <thead>
@@ -2265,17 +1901,17 @@ tbody tr:hover { background: #f4f6ff; }
             <th colspan=3 style="background:#1e3a8a;">Total Revenue (&#8377;)</th>
           </tr>
           <tr>
-            <th style="background:#5a7ae8;font-size:11px;">CY25 MTD</th>
-            <th style="background:#17a34a;font-size:11px;">CY26 MTD</th>
+            <th style="background:#5a7ae8;font-size:11px;">Apr CY25</th>
+            <th style="background:#17a34a;font-size:11px;">Apr CY26</th>
             <th style="background:#2e4baa;font-size:11px;">Growth%</th>
-            <th style="background:#5a7ae8;font-size:11px;">CY25 MTD</th>
-            <th style="background:#17a34a;font-size:11px;">CY26 MTD</th>
+            <th style="background:#5a7ae8;font-size:11px;">Apr CY25</th>
+            <th style="background:#17a34a;font-size:11px;">Apr CY26</th>
             <th style="background:#2e4baa;font-size:11px;">Growth%</th>
-            <th style="background:#5a7ae8;font-size:11px;">CY25 MTD</th>
-            <th style="background:#17a34a;font-size:11px;">CY26 MTD</th>
+            <th style="background:#5a7ae8;font-size:11px;">Apr CY25</th>
+            <th style="background:#17a34a;font-size:11px;">Apr CY26</th>
             <th style="background:#2e4baa;font-size:11px;">Growth%</th>
-            <th style="background:#5a7ae8;font-size:11px;">CY25 MTD</th>
-            <th style="background:#17a34a;font-size:11px;">CY26 MTD</th>
+            <th style="background:#5a7ae8;font-size:11px;">Apr CY25</th>
+            <th style="background:#17a34a;font-size:11px;">Apr CY26</th>
             <th style="background:#2e4baa;font-size:11px;">Growth%</th>
           </tr>
         </thead>
@@ -2297,41 +1933,30 @@ tbody tr:hover { background: #f4f6ff; }
           </tr>
         </thead>
         <tbody id="cm-tbody">
-          <tr><td colspan="8" class="empty-msg">Click the tab to load live data…</td></tr>
+          <tr><td colspan="8" class="empty-msg">Click the tab to load live April data&#8230;</td></tr>
         </tbody>
       </table>
     </div>
-
   </div><!-- /page5 -->
 
   <!-- ==================== PAGE 6 — DIVISION-MONTH CY25 vs CY26 ==================== -->
   <div id="page6" class="tab-page">
-
+    <!-- Info banner: CY26 = Jan+Feb+Mar from CSV -->
+    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#1e40af;">
+      &#8505;&#65039; CY26 data shown here covers <strong>January, February &amp; March 2026</strong> (all from CY26 CSV file).
+      April 2026 is shown live on the <strong>Current Month (Apr)</strong> tab.
+    </div>
     <div class="filter-bar">
-      <div class="fg"><label>Division</label>
-        <div class="custom-select" id="cs6-division" data-key="d6-division" data-placeholder="All Divisions"></div>
-      </div>
-      <div class="fg"><label>Service Type</label>
-        <div class="custom-select" id="cs6-service" data-key="d6-service" data-placeholder="All Service Types"></div>
-      </div>
-      <div class="fg"><label>SA Name</label>
-        <div class="custom-select" id="cs6-sa" data-key="d6-sa" data-placeholder="All SAs"></div>
-      </div>
-      <div class="fg"><label>Invoice Type</label>
-        <div class="custom-select" id="cs6-invoice" data-key="d6-invoice" data-placeholder="All Invoice Types"></div>
-      </div>
-      <div class="fg"><label>Model</label>
-        <div class="custom-select" id="cs6-model" data-key="d6-model" data-placeholder="All Models"></div>
-      </div>
+      <div class="fg"><label>Division</label><div class="custom-select" id="cs6-division" data-key="d6-division" data-placeholder="All Divisions"></div></div>
+      <div class="fg"><label>Service Type</label><div class="custom-select" id="cs6-service" data-key="d6-service" data-placeholder="All Service Types"></div></div>
+      <div class="fg"><label>SA Name</label><div class="custom-select" id="cs6-sa" data-key="d6-sa" data-placeholder="All SAs"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs6-invoice" data-key="d6-invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="cs6-model" data-key="d6-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyDivMonth26()">Apply</button>
       <button class="export-btn" id="export-btn-p6" onclick="exportPage6()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage6()">Reset</button>
     </div>
-
-    <div id="divmonth26-content">
-      <div class="comp-loading">Click the tab to load CY25 vs CY26 data&#8230;</div>
-    </div>
-
+    <div id="divmonth26-content"><div class="comp-loading">Click the tab to load CY25 vs CY26 data&#8230;</div></div>
   </div><!-- /page6 -->
 
 </div><!-- /container -->
@@ -2362,12 +1987,7 @@ function switchTab(pageId, btn) {
 }
 
 /* ====================================================
-   CUSTOM MULTI-SELECT — ALL 5 BUGS FIXED
-   Bug 1: filterList() was never defined
-   Bug 2: document click closed panel instantly on desktop
-   Bug 3: no click listener on row div — only tiny checkbox worked
-   Bug 4: overflow:hidden clipped clickable area
-   Bug 5: inline onclick="..." broke inside Python triple-quoted strings
+   CUSTOM MULTI-SELECT
    ==================================================== */
 const selections     = {};
 const _cachedOptions = {};
@@ -2376,8 +1996,6 @@ function buildCustomSelect(container) {
     var key         = container.dataset.key;
     var placeholder = container.dataset.placeholder || "Select...";
     selections[key] = new Set();
-
-    /* FIX 5: No inline onclick — use IDs + addEventListener instead */
     container.innerHTML =
         '<div class="cs-face" id="face-' + key + '">' + placeholder + '</div>' +
         '<div class="cs-panel" id="panel-' + key + '">' +
@@ -2388,28 +2006,18 @@ function buildCustomSelect(container) {
           '</div>' +
           '<div class="cs-list" id="list-' + key + '"></div>' +
         '</div>';
-
-    /* Wire Select All / Deselect All buttons */
     document.getElementById("sa-btn-" + key).addEventListener("click", function(e) {
         e.stopPropagation(); selectAllVisible(key);
     });
     document.getElementById("cl-btn-" + key).addEventListener("click", function(e) {
         e.stopPropagation(); clearSelect(key);
     });
-
-    /* Face button: open/close, stopPropagation prevents document handler */
     document.getElementById("face-" + key).addEventListener("click", function(e) {
-        e.stopPropagation();
-        togglePanel(key);
+        e.stopPropagation(); togglePanel(key);
     });
-
-    /* FIX 3+panel: stop propagation on panel BUT only on non-item clicks.
-       Items have their own stopPropagation so panel's handler won't interfere. */
     document.getElementById("panel-" + key).addEventListener("click", function(e) {
         e.stopPropagation();
     });
-
-    /* Search input */
     document.getElementById("search-" + key).addEventListener("input", function(e) {
         filterList(key, e.target.value.toLowerCase());
     });
@@ -2418,7 +2026,6 @@ function buildCustomSelect(container) {
     });
 }
 
-/* FIX 1: filterList was MISSING — caused silent JS crash on desktop search */
 function filterList(key, query) {
     document.querySelectorAll("#list-" + key + " .cs-item").forEach(function(item) {
         var val = (item.dataset.value || "").toLowerCase();
@@ -2440,8 +2047,6 @@ function togglePanel(key) {
     var panel  = document.getElementById("panel-" + key);
     var face   = document.getElementById("face-"  + key);
     var isOpen = panel.classList.contains("open");
-
-    /* Close all other open panels first */
     document.querySelectorAll(".cs-panel.open").forEach(function(p) {
         if (p.id !== "panel-" + key) {
             p.classList.remove("open");
@@ -2449,7 +2054,6 @@ function togglePanel(key) {
             if (f) f.classList.remove("open");
         }
     });
-
     if (isOpen) {
         panel.classList.remove("open");
         face.classList.remove("open");
@@ -2460,7 +2064,6 @@ function togglePanel(key) {
         face.classList.add("open");
         var bd = document.getElementById("mob-backdrop");
         if (bd) bd.style.display = "block";
-        /* Auto-focus search on open */
         var srch = document.getElementById("search-" + key);
         if (srch) setTimeout(function() { srch.focus(); }, 30);
     }
@@ -2476,7 +2079,6 @@ function updateFace(key) {
                      : sel.size + " selected";
 }
 
-/* FIX 2: Guard document click — don't close if click was inside panel or on face */
 document.addEventListener("click", function(e) {
     if (e.target.closest && (e.target.closest(".cs-panel") || e.target.closest(".cs-face"))) return;
     closeAllPanels();
@@ -2507,43 +2109,37 @@ function pctBadge(val) {
 }
 
 /* ====================================================
-   PAGE 1 — FILTERS, CARDS, TABLE
+   PAGE 1
    ==================================================== */
 async function loadFilters() {
     try {
         const data = await fetch("/filters").then(r => r.json());
-        // Page 1
         fillCustomSelect("division", data.division);
         fillCustomSelect("service",  data.service);
         fillCustomSelect("sa",       data.sa);
         fillCustomSelect("invoice",  data.invoice);
         fillCustomSelect("month",    data.month);
         fillCustomSelect("model",    data.model);
-        // Page 2 — CY Comparison
         fillCustomSelect("c-division", data.division);
         fillCustomSelect("c-service",  data.service);
         fillCustomSelect("c-sa",       data.sa);
         fillCustomSelect("c-invoice",  data.invoice);
         fillCustomSelect("c-model",    data.model);
-        // Page 3 — Division-Month
         fillCustomSelect("d-division", data.division);
         fillCustomSelect("d-service",  data.service);
         fillCustomSelect("d-sa",       data.sa);
         fillCustomSelect("d-invoice",  data.invoice);
         fillCustomSelect("d-model",    data.model);
-        // Page 4 — One Pager
         fillCustomSelect("op-division", data.division);
         fillCustomSelect("op-service",  data.service);
         fillCustomSelect("op-sa",       data.sa);
         fillCustomSelect("op-invoice",  data.invoice);
         fillCustomSelect("op-model",    data.model);
         fillCustomSelect("op-month",    data.month);
-        // Page 5 — Current Month
         fillCustomSelect("cm-division", data.division);
         fillCustomSelect("cm-service",  data.service);
         fillCustomSelect("cm-sa",       data.sa);
         fillCustomSelect("cm-model",    data.model);
-        // Page 6 — Division-Month CY26
         fillCustomSelect("d6-division", data.division);
         fillCustomSelect("d6-service",  data.service);
         fillCustomSelect("d6-sa",       data.sa);
@@ -2562,10 +2158,7 @@ function buildCompParams() {
     return p.toString();
 }
 
-function applyComparison() {
-    compLoaded = true;
-    loadComparison();
-}
+function applyComparison() { compLoaded = true; loadComparison(); }
 
 async function loadCards() {
     try {
@@ -2581,7 +2174,7 @@ async function loadCards() {
 
 async function loadTable() {
     const tbody = document.getElementById("tbody");
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">Loading…</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">Loading&#8230;</td></tr>';
     try {
         const data = await fetch("/table?" + buildParams()).then(r => r.json());
         if (!data.length) {
@@ -2600,7 +2193,7 @@ async function loadTable() {
             <td style="font-weight:600;color:#4f6bdc;">${fmt(r["Total Revenue"])}</td>
           </tr>`).join("");
     } catch(e) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty-msg">Error loading data</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">Error loading data</td></tr>';
         console.error("Table load failed", e);
     }
 }
@@ -2639,39 +2232,22 @@ async function _triggerExport(url, filename, btnId) {
     finally { if (btn) { btn.disabled = false; btn.textContent = "Export Excel"; } }
 }
 
-function exportPage2() {
-    _triggerExport("/export-comparison?" + buildCompParams(), "Renault_CY_Comparison_Export.xlsx", "export-btn-p2");
-}
-
-function exportPage3() {
-    _triggerExport("/export-division-month?" + buildDivMonParams(), "Renault_DivisionMonth_Export.xlsx", "export-btn-p3");
-}
-
-function exportPage4() {
-    _triggerExport("/export-one-pager?" + buildOpParams(), "Renault_OnePager_Export.xlsx", "export-btn-p4");
-}
-
-function exportPage5() {
-    _triggerExport("/export-current-month?" + buildCmParams(), "Renault_CurrentMonth_Export.xlsx", "export-btn-p5");
-}
-
-function exportPage6() {
-    _triggerExport("/export-division-month-cy26?" + buildDm26Params(), "Renault_DivMonth_CY26_Export.xlsx", "export-btn-p6");
-}
+function exportPage2() { _triggerExport("/export-comparison?" + buildCompParams(), "Renault_CY_Comparison_Export.xlsx", "export-btn-p2"); }
+function exportPage3() { _triggerExport("/export-division-month?" + buildDivMonParams(), "Renault_DivisionMonth_Export.xlsx", "export-btn-p3"); }
+function exportPage4() { _triggerExport("/export-one-pager?" + buildOpParams(), "Renault_OnePager_Export.xlsx", "export-btn-p4"); }
+function exportPage5() { _triggerExport("/export-current-month?" + buildCmParams(), "Renault_CurrentMonth_Export.xlsx", "export-btn-p5"); }
+function exportPage6() { _triggerExport("/export-division-month-cy26?" + buildDm26Params(), "Renault_DivMonth_CY26_Export.xlsx", "export-btn-p6"); }
 
 /* ====================================================
    PAGE 2 — CY COMPARISON
    ==================================================== */
 async function loadComparison() {
     const wrap = document.getElementById("comp-content");
-    wrap.innerHTML = '<div class="comp-loading">Loading comparison data…</div>';
+    wrap.innerHTML = '<div class="comp-loading">Loading comparison data&#8230;</div>';
     try {
         const rows = await fetch("/comparison?" + buildCompParams()).then(r => r.json());
-        if (!rows.length) {
-            wrap.innerHTML = '<div class="comp-loading">No data available</div>'; return;
-        }
+        if (!rows.length) { wrap.innerHTML = '<div class="comp-loading">No data available</div>'; return; }
 
-        // Totals
         const tot = { i24:0, i25:0, l24:0, l25:0, s24:0, s25:0, t24:0, t25:0 };
         rows.forEach(r => {
             tot.i24 += r.inflow24; tot.i25 += r.inflow25;
@@ -2679,13 +2255,9 @@ async function loadComparison() {
             tot.s24 += r.spares24; tot.s25 += r.spares25;
             tot.t24 += r.total24;  tot.t25 += r.total25;
         });
-        const totIPct = tot.i24 ? ((tot.i25-tot.i24)/tot.i24*100).toFixed(1) : null;
-        const totLPct = tot.l24 ? ((tot.l25-tot.l24)/tot.l24*100).toFixed(1) : null;
-        const totSPct = tot.s24 ? ((tot.s25-tot.s24)/tot.s24*100).toFixed(1) : null;
-        const totTPct = tot.t24 ? ((tot.t25-tot.t24)/tot.t24*100).toFixed(1) : null;
 
         function buildTable(title, cy24key, cy25key, pctKey, isCurrency) {
-            const f = v => isCurrency ? "₹ " + fmt(v) : Number(v).toLocaleString("en-IN");
+            const f = v => isCurrency ? "\u20b9 " + fmt(v) : Number(v).toLocaleString("en-IN");
             const rows_html = rows.map(r => `
               <tr>
                 <td>${r.month}</td>
@@ -2693,49 +2265,29 @@ async function loadComparison() {
                 <td>${f(r[cy25key])}</td>
                 <td>${pctBadge(r[pctKey])}</td>
               </tr>`).join("");
-
-            const t24 = isCurrency ? tot.l24 : tot.i24;
-            const t25 = isCurrency ? tot.l25 : tot.i25;
-            // pick right totals
             let tot24, tot25, totPct;
-            if (cy24key === "inflow24")  { tot24=tot.i24; tot25=tot.i25; totPct=totIPct; }
-            else if (cy24key === "labour24") { tot24=tot.l24; tot25=tot.l25; totPct=totLPct; }
-            else if (cy24key === "spares24") { tot24=tot.s24; tot25=tot.s25; totPct=totSPct; }
-            else { tot24=tot.t24; tot25=tot.t25; totPct=totTPct; }
-
+            if (cy24key === "inflow24")  { tot24=tot.i24; tot25=tot.i25; totPct=tot.i24?((tot.i25-tot.i24)/tot.i24*100).toFixed(1):null; }
+            else if (cy24key === "labour24") { tot24=tot.l24; tot25=tot.l25; totPct=tot.l24?((tot.l25-tot.l24)/tot.l24*100).toFixed(1):null; }
+            else if (cy24key === "spares24") { tot24=tot.s24; tot25=tot.s25; totPct=tot.s24?((tot.s25-tot.s24)/tot.s24*100).toFixed(1):null; }
+            else { tot24=tot.t24; tot25=tot.t25; totPct=tot.t24?((tot.t25-tot.t24)/tot.t24*100).toFixed(1):null; }
             return `
               <div class="comp-section">
                 <h3>${title}</h3>
                 <div class="table-wrap">
                   <table class="comp-table">
-                    <thead>
-                      <tr>
-                        <th>Month</th>
-                        <th>CY 2024</th>
-                        <th>CY 2025</th>
-                        <th>Difference %</th>
-                      </tr>
-                    </thead>
+                    <thead><tr><th>Month</th><th>CY 2024</th><th>CY 2025</th><th>Difference %</th></tr></thead>
                     <tbody>${rows_html}</tbody>
-                    <tfoot>
-                      <tr>
-                        <td>Total</td>
-                        <td>${f(tot24)}</td>
-                        <td>${f(tot25)}</td>
-                        <td>${pctBadge(parseFloat(totPct))}</td>
-                      </tr>
-                    </tfoot>
+                    <tfoot><tr><td>Total</td><td>${f(tot24)}</td><td>${f(tot25)}</td><td>${pctBadge(parseFloat(totPct))}</td></tr></tfoot>
                   </table>
                 </div>
               </div>`;
         }
 
         wrap.innerHTML =
-            buildTable("📥 Inflow Comparison (Unique ROs)", "inflow24", "inflow25", "inflow_pct", false) +
-            buildTable("🔧 Labour Revenue Comparison",      "labour24", "labour25", "labour_pct", true)  +
-            buildTable("🔩 Spares Revenue Comparison",      "spares24", "spares25", "spares_pct", true)  +
-            buildTable("💰 Total Revenue Comparison",       "total24",  "total25",  "total_pct",  true);
-
+            buildTable("&#128229; Inflow Comparison (Unique ROs)", "inflow24", "inflow25", "inflow_pct", false) +
+            buildTable("&#128295; Labour Revenue Comparison",      "labour24", "labour25", "labour_pct", true)  +
+            buildTable("&#128297; Spares Revenue Comparison",      "spares24", "spares25", "spares_pct", true)  +
+            buildTable("&#128176; Total Revenue Comparison",       "total24",  "total25",  "total_pct",  true);
     } catch(e) {
         wrap.innerHTML = '<div class="comp-loading">Error loading comparison data</div>';
         console.error("Comparison load failed", e);
@@ -2757,15 +2309,11 @@ function applyDivMonth() { divMonLoaded = true; loadDivMonth(); }
 
 async function loadDivMonth() {
     const wrap = document.getElementById("divmonth-content");
-    wrap.innerHTML = '<div class="comp-loading">Loading…</div>';
+    wrap.innerHTML = '<div class="comp-loading">Loading&#8230;</div>';
     try {
         const { divisions, months, rows } = await fetch("/division-month?" + buildDivMonParams()).then(r => r.json());
+        if (!divisions.length) { wrap.innerHTML = '<div class="comp-loading">No data available</div>'; return; }
 
-        if (!divisions.length) {
-            wrap.innerHTML = '<div class="comp-loading">No data available</div>'; return;
-        }
-
-        // Index rows by division
         const byDiv = {};
         rows.forEach(r => byDiv[r.division] = r);
 
@@ -2778,25 +2326,15 @@ async function loadDivMonth() {
         }
 
         function buildPivot(title, prefix, isCurrency) {
-            const f = v => isCurrency
-                ? fmt(v)
-                : Number(v||0).toLocaleString("en-IN");
-
-            // Header row 1: Division | Jan(span3) | Feb(span3) | … | Total(span3)
+            const f = v => isCurrency ? fmt(v) : Number(v||0).toLocaleString("en-IN");
             let hdr1 = `<th rowspan="2" style="min-width:80px;">Division</th>`;
             months.forEach(m => hdr1 += `<th colspan="3">${m}</th>`);
             hdr1 += `<th colspan="3">Total</th>`;
-
-            // Header row 2: CY24 | CY25 | Growth% per month + total
             let hdr2 = "";
-            [...months, "Total"].forEach(() =>
-                hdr2 += `<th>CY24</th><th>CY25</th><th>Growth%</th>`);
-
-            // Data rows
+            [...months, "Total"].forEach(() => hdr2 += `<th>CY24</th><th>CY25</th><th>Growth%</th>`);
             let body = "";
             const gTot24 = new Array(months.length).fill(0);
             const gTot25 = new Array(months.length).fill(0);
-
             divisions.forEach(div => {
                 const r = byDiv[div];
                 let cells = "";
@@ -2808,59 +2346,37 @@ async function loadDivMonth() {
                     gTot24[mi] += v24; gTot25[mi] += v25;
                     cells += `<td>${f(v24)}</td><td>${f(v25)}</td><td>${gPct(v24,v25)}</td>`;
                 });
-                body += `<tr>
-                    <td>${div}</td>
-                    ${cells}
-                    <td style="font-weight:700;">${f(rSum24)}</td>
-                    <td style="font-weight:700;color:#4f6bdc;">${f(rSum25)}</td>
-                    <td>${gPct(rSum24, rSum25)}</td>
-                  </tr>`;
+                body += `<tr><td>${div}</td>${cells}<td style="font-weight:700;">${f(rSum24)}</td><td style="font-weight:700;color:#4f6bdc;">${f(rSum25)}</td><td>${gPct(rSum24, rSum25)}</td></tr>`;
             });
-
-            // Footer: Grand Total
             let footCells = "";
             let gSum24 = 0, gSum25 = 0;
             gTot24.forEach((v, i) => {
                 gSum24 += v; gSum25 += gTot25[i];
                 footCells += `<td>${f(v)}</td><td>${f(gTot25[i])}</td><td>${gPct(v, gTot25[i])}</td>`;
             });
-
             return `
               <div class="pivot-section comp-section">
                 <h3>${title}</h3>
                 <div class="pivot-wrap">
                   <table class="pivot-table">
-                    <thead>
-                      <tr>${hdr1}</tr>
-                      <tr>${hdr2}</tr>
-                    </thead>
+                    <thead><tr>${hdr1}</tr><tr>${hdr2}</tr></thead>
                     <tbody>${body}</tbody>
-                    <tfoot>
-                      <tr>
-                        <td>Grand Total</td>
-                        ${footCells}
-                        <td>${f(gSum24)}</td>
-                        <td>${f(gSum25)}</td>
-                        <td>${gPct(gSum24, gSum25)}</td>
-                      </tr>
-                    </tfoot>
+                    <tfoot><tr><td>Grand Total</td>${footCells}<td>${f(gSum24)}</td><td>${f(gSum25)}</td><td>${gPct(gSum24, gSum25)}</td></tr></tfoot>
                   </table>
                 </div>
               </div>`;
         }
 
         wrap.innerHTML =
-            buildPivot("📥 Inflow — Division × Month (CY24 vs CY25)",         "i", false) +
-            buildPivot("🔧 Labour — Division × Month (CY24 vs CY25)",         "l", true)  +
-            buildPivot("🔩 Spares — Division × Month (CY24 vs CY25)",         "s", true)  +
-            buildPivot("💰 Total Revenue — Division × Month (CY24 vs CY25)",  "t", true);
-
+            buildPivot("&#128229; Inflow — Division &times; Month (CY24 vs CY25)",         "i", false) +
+            buildPivot("&#128295; Labour — Division &times; Month (CY24 vs CY25)",         "l", true)  +
+            buildPivot("&#128297; Spares — Division &times; Month (CY24 vs CY25)",         "s", true)  +
+            buildPivot("&#128176; Total Revenue — Division &times; Month (CY24 vs CY25)",  "t", true);
     } catch(e) {
         wrap.innerHTML = '<div class="comp-loading">Error loading data</div>';
         console.error("DivMonth load failed", e);
     }
 }
-
 
 /* ====================================================
    PAGE 4 — ONE PAGER REPORT
@@ -2885,12 +2401,10 @@ async function loadOnePager() {
         var json = await resp.json();
         var divisions = json.divisions;
         var rows = json.rows;
-
         if (!rows || !rows.length) {
-            wrap.innerHTML = '<div class="comp-loading">No data available. Check service type mapping.</div>';
+            wrap.innerHTML = '<div class="comp-loading">No data available.</div>';
             return;
         }
-
         var byDiv = {};
         rows.forEach(function(r) { byDiv[r.division] = r; });
         var totalRow = byDiv["TOTAL"] || {};
@@ -2958,15 +2472,14 @@ async function loadOnePager() {
             '<thead><tr><th class="desc-hdr">Description</th>' + colHdrs + '</tr></thead>' +
             '<tbody>' + tbody + '</tbody>' +
             '</table></div>';
-
     } catch(e) {
-        wrap.innerHTML = '<div class="comp-loading">Error loading data - check console.</div>';
+        wrap.innerHTML = '<div class="comp-loading">Error loading data.</div>';
         console.error("OnePager load failed", e);
     }
 }
 
 /* ====================================================
-   PAGE 5 — CURRENT MONTH (Live Google Sheet)
+   PAGE 5 — CURRENT MONTH (APRIL — Google Sheet)
    ==================================================== */
 function buildCmParams() {
     var p = new URLSearchParams();
@@ -2982,7 +2495,7 @@ async function loadCurrentMonth() {
     if (!window._cmJsLoaded) {
         await new Promise(function(resolve, reject) {
             var s = document.createElement("script");
-            s.src = "/cm.js?v=1";
+            s.src = "/cm.js?v=2";
             s.onload = resolve;
             s.onerror = reject;
             document.head.appendChild(s);
@@ -3002,33 +2515,32 @@ function resetKeys(keys) {
 function resetPage1() {
     document.getElementById("cy").value = "";
     resetKeys(["division","service","sa","invoice","model","month"]);
-    loadCards();
-    loadTable();
+    loadCards(); loadTable();
 }
-
 function resetPage2() {
     resetKeys(["c-division","c-service","c-sa","c-invoice","c-model"]);
     loadComparison();
 }
-
 function resetPage3() {
     resetKeys(["d-division","d-service","d-sa","d-invoice","d-model"]);
     loadDivMonth();
 }
-
-function resetPage5() {
-    resetKeys(["cm-division","cm-service","cm-sa","cm-model"]);
-    loadCurrentMonth();
-}
-
 function resetPage4() {
     document.getElementById("op-cy").value = "";
     resetKeys(["op-division","op-service","op-sa","op-invoice","op-model","op-month"]);
     loadOnePager();
 }
+function resetPage5() {
+    resetKeys(["cm-division","cm-service","cm-sa","cm-model"]);
+    loadCurrentMonth();
+}
+function resetPage6() {
+    resetKeys(["d6-division","d6-service","d6-sa","d6-invoice","d6-model"]);
+    loadDivMonth26();
+}
 
 /* ====================================================
-   PAGE 6 — DIVISION-MONTH CY25 vs CY26
+   PAGE 6 — DIVISION-MONTH CY25 vs CY26 (Jan/Feb/Mar from CSV)
    ==================================================== */
 function buildDm26Params() {
     var p = new URLSearchParams();
@@ -3040,14 +2552,9 @@ function buildDm26Params() {
 
 function applyDivMonth26() { dm26Loaded = true; loadDivMonth26(); }
 
-function resetPage6() {
-    resetKeys(["d6-division","d6-service","d6-sa","d6-invoice","d6-model"]);
-    loadDivMonth26();
-}
-
 async function loadDivMonth26() {
     var wrap = document.getElementById("divmonth26-content");
-    wrap.innerHTML = "<div class=comp-loading>Loading CY25 vs CY26 pivot...</div>";
+    wrap.innerHTML = "<div class=comp-loading>Loading CY25 vs CY26 pivot (Jan-Mar from CSV)...</div>";
     try {
         var resp = await fetch("/division-month-cy26?" + buildDm26Params());
         var data = await resp.json();
@@ -3127,10 +2634,10 @@ async function loadDivMonth26() {
         }
 
         wrap.innerHTML =
-            buildPivot26("Inflow - Division x Month (CY25 vs CY26)",         "i", false) +
-            buildPivot26("Labour - Division x Month (CY25 vs CY26)",         "l", true)  +
-            buildPivot26("Spares - Division x Month (CY25 vs CY26)",         "s", true)  +
-            buildPivot26("Total Revenue - Division x Month (CY25 vs CY26)",  "t", true);
+            buildPivot26("&#128229; Inflow - Division &times; Month (CY25 vs CY26: Jan-Mar)",         "i", false) +
+            buildPivot26("&#128295; Labour - Division &times; Month (CY25 vs CY26: Jan-Mar)",         "l", true)  +
+            buildPivot26("&#128297; Spares - Division &times; Month (CY25 vs CY26: Jan-Mar)",         "s", true)  +
+            buildPivot26("&#128176; Total Revenue - Division &times; Month (CY25 vs CY26: Jan-Mar)",  "t", true);
 
     } catch(e) {
         wrap.innerHTML = "<div class=comp-loading>Error loading data: " + e.message + "</div>";
@@ -3139,34 +2646,8 @@ async function loadDivMonth26() {
 }
 
 /* ====================================================
-   INIT
+   FILTER SYSTEM
    ==================================================== */
-window.onload = function () {
-    // Tab scroll hint — hide when scrolled to end
-    var tabsEl = document.getElementById("tabsEl");
-    var hint   = document.getElementById("tabScrollHint");
-    if (tabsEl && hint) {
-        tabsEl.addEventListener("scroll", function() {
-            var atEnd = tabsEl.scrollLeft + tabsEl.clientWidth >= tabsEl.scrollWidth - 4;
-            hint.style.display = atEnd ? "none" : "flex";
-        });
-        // Scroll active tab into view on tab switch
-        document.querySelectorAll(".tab-btn").forEach(function(btn) {
-            btn.addEventListener("click", function() {
-                btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
-            });
-        });
-    }
-    document.querySelectorAll(".custom-select").forEach(buildCustomSelect);
-    loadFilters();
-    loadCards();
-    loadTable();
-};
-/* ====================================================
-   FILTER SYSTEM — COMPLETE IMPLEMENTATION
-   ==================================================== */
-
-// Division key -> [cy-selector-id, dependent-keys[]]
 var filterGroups = {
     "division":    ["cy",    ["service","sa","invoice","model","month"]],
     "c-division":  [null,    ["c-service","c-sa","c-invoice","c-model"]],
@@ -3175,19 +2656,15 @@ var filterGroups = {
     "op-division": ["op-cy", ["op-service","op-sa","op-invoice","op-model","op-month"]],
     "cm-division": [null,    ["cm-service","cm-sa","cm-model"]],
 };
-
 var DIV_KEYS = ["division","c-division","d-division","d6-division","op-division","cm-division"];
 
-function isDivisionKey(key) {
-    return DIV_KEYS.indexOf(key) !== -1;
-}
+function isDivisionKey(key) { return DIV_KEYS.indexOf(key) !== -1; }
 
-// ── Fill dropdown WITH event listeners (initial load only) ─────────────
 function fillCustomSelect(key, list) {
     var listEl = document.getElementById("list-" + key);
     if (!listEl) return;
     if (!selections[key]) selections[key] = new Set();
-    _cachedOptions[key] = list.slice();  // cache for reset
+    _cachedOptions[key] = list.slice();
     listEl.innerHTML = "";
     list.forEach(function(v) {
         var item = document.createElement("div");
@@ -3200,9 +2677,6 @@ function fillCustomSelect(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-
-        /* FIX 3: Row click toggles checkbox — works on desktop where
-           clicking label/row text would otherwise do nothing */
         item.addEventListener("click", function(e) {
             e.stopPropagation();
             if (e.target !== chk) { chk.checked = !chk.checked; }
@@ -3212,28 +2686,21 @@ function fillCustomSelect(key, list) {
             updateFace(key);
             if (isDivisionKey(key)) refreshDependentFilters(key);
         });
-        chk.addEventListener("change", function(e) {
-            e.stopPropagation();
-        });
-
+        chk.addEventListener("change", function(e) { e.stopPropagation(); });
         listEl.appendChild(item);
     });
     updateFace(key);
 }
 
-// ── Refill dropdown (dependent refresh) — keeps valid prior selections ──
 function fillDropdownOnly(key, list) {
     var listEl = document.getElementById("list-" + key);
     if (!listEl) return;
     if (!selections[key]) selections[key] = new Set();
-
-    // Keep only selections that still exist in new list
     var validVals = {};
     list.forEach(function(v) { validVals[v] = true; });
     var newSel = new Set();
     selections[key].forEach(function(v) { if (validVals[v]) newSel.add(v); });
     selections[key] = newSel;
-
     listEl.innerHTML = "";
     list.forEach(function(v) {
         var item = document.createElement("div");
@@ -3248,8 +2715,6 @@ function fillDropdownOnly(key, list) {
         item.appendChild(chk);
         item.appendChild(document.createTextNode(" "));
         item.appendChild(lbl);
-
-        /* FIX 3: Row click toggles checkbox */
         item.addEventListener("click", function(e) {
             e.stopPropagation();
             if (e.target !== chk) { chk.checked = !chk.checked; }
@@ -3258,20 +2723,15 @@ function fillDropdownOnly(key, list) {
             item.classList.toggle("checked", chk.checked);
             updateFace(key);
         });
-        chk.addEventListener("change", function(e) {
-            e.stopPropagation();
-        });
-
+        chk.addEventListener("change", function(e) { e.stopPropagation(); });
         listEl.appendChild(item);
     });
     updateFace(key);
 }
 
-// ── Select All visible items ────────────────────────────────────────────
 function selectAllVisible(key) {
     if (!selections[key]) selections[key] = new Set();
-    var items = document.querySelectorAll("#list-" + key + " .cs-item");
-    items.forEach(function(item) {
+    document.querySelectorAll("#list-" + key + " .cs-item").forEach(function(item) {
         if (item.style.display === "none") return;
         var v = item.dataset.value;
         selections[key].add(v);
@@ -3282,7 +2742,6 @@ function selectAllVisible(key) {
     if (isDivisionKey(key)) refreshDependentFilters(key);
 }
 
-// ── Deselect All ────────────────────────────────────────────────────────
 function clearSelect(key) {
     if (!selections[key]) selections[key] = new Set();
     selections[key].clear();
@@ -3297,80 +2756,74 @@ function clearSelect(key) {
     var srch = document.getElementById("search-" + key);
     if (srch) srch.value = "";
     updateFace(key);
-    // When division cleared -> restore ALL options for dependent dropdowns
     if (isDivisionKey(key)) refreshDependentFilters(key);
 }
 
-// ── Refresh dependent dropdowns when division selection changes ─────────
 async function refreshDependentFilters(divKey) {
     var group = filterGroups[divKey];
     if (!group) return;
-
     var cyId    = group[0];
     var depKeys = group[1];
     var divVals = [];
-    if (selections[divKey]) {
-        selections[divKey].forEach(function(v) { divVals.push(v); });
-    }
-
+    if (selections[divKey]) selections[divKey].forEach(function(v) { divVals.push(v); });
     var cy = "";
-    if (cyId) {
-        var cyEl = document.getElementById(cyId);
-        if (cyEl) cy = cyEl.value || "";
-    }
-
-    // If NO division selected and NO cy -> restore full options
+    if (cyId) { var cyEl = document.getElementById(cyId); if (cyEl) cy = cyEl.value || ""; }
     if (divVals.length === 0 && !cy) {
         try {
             var resp = await fetch("/filters");
             var data = await resp.json();
             var keyMap = {
-                "service":"service","c-service":"service","d-service":"service",
-                "d6-service":"service","op-service":"service",
+                "service":"service","c-service":"service","d-service":"service","d6-service":"service","op-service":"service",
                 "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa",
-                "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice",
-                "d6-invoice":"invoice","op-invoice":"invoice",
-                "model":"model","c-model":"model","d-model":"model",
-                "d6-model":"model","op-model":"model",
+                "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice","d6-invoice":"invoice","op-invoice":"invoice",
+                "model":"model","c-model":"model","d-model":"model","d6-model":"model","op-model":"model",
                 "month":"month","op-month":"month",
             };
-            depKeys.forEach(function(dk) {
-                var dataKey = keyMap[dk];
-                if (data[dataKey]) fillDropdownOnly(dk, data[dataKey]);
-            });
+            depKeys.forEach(function(dk) { var dk2 = keyMap[dk]; if (data[dk2]) fillDropdownOnly(dk, data[dk2]); });
         } catch(e) { console.warn("refreshDependentFilters (full) failed:", e); }
         return;
     }
-
-    // Build params for filtered fetch
     var p = new URLSearchParams();
     if (cy) p.append("cy", cy);
     divVals.forEach(function(v) { p.append("division", v); });
-
     try {
         var resp = await fetch("/filters-dep?" + p.toString());
         var data = await resp.json();
         var keyMap = {
-            "service":"service","c-service":"service","d-service":"service",
-            "d6-service":"service","op-service":"service",
+            "service":"service","c-service":"service","d-service":"service","d6-service":"service","op-service":"service",
             "sa":"sa","c-sa":"sa","d-sa":"sa","d6-sa":"sa","op-sa":"sa",
-            "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice",
-            "d6-invoice":"invoice","op-invoice":"invoice",
-            "model":"model","c-model":"model","d-model":"model",
-            "d6-model":"model","op-model":"model",
+            "invoice":"invoice","c-invoice":"invoice","d-invoice":"invoice","d6-invoice":"invoice","op-invoice":"invoice",
+            "model":"model","c-model":"model","d-model":"model","d6-model":"model","op-model":"model",
             "month":"month","op-month":"month",
         };
-        depKeys.forEach(function(dk) {
-            var dataKey = keyMap[dk];
-            if (data[dataKey]) fillDropdownOnly(dk, data[dataKey]);
-        });
-    } catch(e) {
-        console.warn("refreshDependentFilters failed:", e.message);
-    }
+        depKeys.forEach(function(dk) { var dk2 = keyMap[dk]; if (data[dk2]) fillDropdownOnly(dk, data[dk2]); });
+    } catch(e) { console.warn("refreshDependentFilters failed:", e.message); }
 }
 
-
+/* ====================================================
+   INIT
+   ==================================================== */
+window.onload = function () {
+    var tabsEl = document.getElementById("tabsEl");
+    var hint   = document.getElementById("tabScrollHint");
+    if (tabsEl && hint) {
+        tabsEl.addEventListener("scroll", function() {
+            var atEnd = tabsEl.scrollLeft + tabsEl.clientWidth >= tabsEl.scrollWidth - 4;
+            hint.style.display = atEnd ? "none" : "flex";
+        });
+        document.querySelectorAll(".tab-btn").forEach(function(btn) {
+            btn.addEventListener("click", function() {
+                btn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+            });
+        });
+    }
+    document.querySelectorAll(".custom-select").forEach(buildCustomSelect);
+    loadFilters();
+    loadCards();
+    loadTable();
+};
 </script>
 </body>
 </html>""")
-# ── Render uses: uvicorn main:app --host 0.0.0.0 --port 10000 ──
+
+# ── Render: uvicorn main:app --host 0.0.0.0 --port 10000 ──
