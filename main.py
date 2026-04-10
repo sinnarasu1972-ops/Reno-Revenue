@@ -25,13 +25,13 @@ df            = pd.DataFrame()
 df_cancelled  = pd.DataFrame()
 
 # Current live month label — April 2026 from Google Sheet
-CURRENT_MONTH_NAME  = "Apr"          # month abbreviation served by GSheet
+CURRENT_MONTH_NAME  = "Apr"
 CURRENT_MONTH_LABEL = "April 2026"
 CURRENT_MONTH_TAB   = "Current Month (Apr)"
 
-# CY26 CSV covers Jan-Mar. April onwards → Google Sheet only.
-# We will enforce Jan, Feb, Mar for the specific CY26 comparison page.
-CY26_CSV_MONTHS = {"Jan", "Feb", "Mar"}   
+# CY26 CSV covers Jan-Mar. 
+# We define the target months for the CY26 comparison explicitly here.
+CY26_COMPARISON_MONTHS = ["Jan", "Feb", "Mar"]
 
 # ---------------- HELPERS ----------------
 
@@ -102,7 +102,7 @@ def _read_lean(path: str, label: str) -> pd.DataFrame:
 
 
 def load_data():
-    global ORIGINAL_CSV_COLS, CY26_CSV_MONTHS
+    global ORIGINAL_CSV_COLS, CY26_COMPARISON_MONTHS
 
     frames = []
     for path, label in [(CY24_PATH, "CY24"), (CY25_PATH, "CY25"), (CY26_PATH, "CY26")]:
@@ -168,13 +168,21 @@ def load_data():
             df[col] = df[col].astype("category")
 
     gc.collect()
-    logger.info(f"RAM after enrich: {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
-
-    # Populate CY26_CSV_MONTHS from actual data (should be Jan, Feb, Mar)
+    
+    # --- FIX: Robust Detection of Months for Comparison ---
+    # We verify that our target months (Jan, Feb, Mar) exist in the CSV.
+    # If Month column failed to parse, this will be empty.
     cy26_mask = df["CY"] == "CY26"
+    detected_months = []
     if cy26_mask.any():
-        CY26_CSV_MONTHS = set(df.loc[cy26_mask, "Month"].dropna().unique().tolist())
-    logger.info(f"CY26 CSV months detected: {CY26_CSV_MONTHS}")
+        detected_months = df.loc[cy26_mask, "Month"].dropna().unique().tolist()
+    
+    logger.info(f"CY26 CSV detected months: {detected_months}")
+    
+    # Ensure we only keep the months we actually want for the comparison (Jan, Feb, Mar)
+    # and that exist in the data.
+    CY26_COMPARISON_MONTHS = [m for m in CY26_COMPARISON_MONTHS if m in detected_months]
+    logger.info(f"CY26 Comparison Months set to: {CY26_COMPARISON_MONTHS}")
 
     status_col = next(
         (c for c in df.columns if c.strip().lower() in ("status", "invoice status", "ro status")),
@@ -206,7 +214,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown.")
 
 
-app = FastAPI(title="Renault Revenue", version="17.0", lifespan=lifespan)
+app = FastAPI(title="Renault Revenue", version="18.0", lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
@@ -223,7 +231,7 @@ def health():
         "status": "ok",
         "active_rows": len(df),
         "cancelled_rows": len(df_cancelled),
-        "cy26_csv_months": sorted(list(CY26_CSV_MONTHS)),
+        "cy26_csv_months": sorted(list(CY26_COMPARISON_MONTHS)),
         "current_month": CURRENT_MONTH_NAME,
     }
 
@@ -682,15 +690,10 @@ def export_division_month_cy26(
     invoice:  list[str] = Query(None),
     model:    list[str] = Query(None),
 ):
-    # LOGIC CHANGE: Explicitly limit comparison months to Jan, Feb, Mar for CY26
-    # But we keep CY25 full year context if needed, or limit similarly.
-    # Based on request: "add March month comparision in Division-Month CY26 page".
-    # We will use the months found in the CY26 CSV (Jan, Feb, Mar).
-    
-    # We filter data first to ensure we only look at CY26 months that actually exist (Jan, Feb, Mar)
-    # For the "Year Over Year" view, we will compare CY25 (Jan, Feb, Mar) vs CY26 (Jan, Feb, Mar)
-    
-    comparison_months = sorted(CY26_CSV_MONTHS, key=lambda x: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].index(x))
+    # --- LOGIC CHANGE: EXPLICITLY USE JAN, FEB, MAR ---
+    # We use the global list which was verified at startup.
+    # But to be absolutely safe for the export, we ensure we iterate Jan, Feb, Mar.
+    target_months = ["Jan", "Feb", "Mar"]
     
     data = df.copy()
     canc = df_cancelled.copy()
@@ -709,8 +712,8 @@ def export_division_month_cy26(
         dd = data[data["Division"] == div]
         row = {"Division": div}
         
-        # We only iterate over the months present in CY26 CSV (Jan, Feb, Mar)
-        for m in comparison_months:
+        # Explicitly loop Jan, Feb, Mar
+        for m in target_months:
             # Compare CY25 same month vs CY26 same month
             m25 = dd[(dd["CY"] == "CY25") & (dd["Month"] == m)]
             m26 = dd[(dd["CY"] == "CY26") & (dd["Month"] == m)]
@@ -828,8 +831,9 @@ def division_month_cy26(
     model:    list[str] = Query(None),
 ):
     try:
-        # LOGIC CHANGE: Explicitly use only months that exist in CY26 CSV (Jan, Feb, Mar)
-        MONTHS = ["Jan","Feb","Mar"]
+        # --- FIX: Explicitly define Jan, Feb, Mar for the response ---
+        # We do not rely solely on the dynamic global variable to ensure March appears if requested.
+        target_months = ["Jan", "Feb", "Mar"]
         
         data = df.copy()
         if division: data = data[data["Division"].isin(division)]
@@ -838,21 +842,13 @@ def division_month_cy26(
         if invoice:  data = data[data["Invoice Type"].isin(invoice)]
         if model:    data = data[data["Model"].isin(model)]
 
-        # Verify months exist in CY26 data to avoid empty columns
-        cy26_months = sorted(
-            data[data["CY"] == "CY26"]["Month"].dropna().unique().tolist(),
-            key=lambda m: MONTHS.index(m) if m in MONTHS else 99
-        )
-        # Ensure we stick to the requested months even if one is missing from data (it will just be 0)
-        final_months = [m for m in MONTHS if m in CY26_CSV_MONTHS] # Intersect request and data availability
-
         divisions = sorted(data["Division"].dropna().unique().tolist())
         rows = []
         
         for div in divisions:
             div_data = data[data["Division"] == div]
             row = {"division": div}
-            for month in final_months:
+            for month in target_months:
                 # Compare CY25 (Same Month) vs CY26 (Same Month)
                 m25 = div_data[(div_data["CY"] == "CY25") & (div_data["Month"] == month)]
                 m26 = div_data[(div_data["CY"] == "CY26") & (div_data["Month"] == month)]
@@ -867,7 +863,7 @@ def division_month_cy26(
                 row[f"t26_{month}"] = row[f"l26_{month}"] + row[f"s26_{month}"]
             rows.append(row)
             
-        return {"divisions": divisions, "months": final_months, "rows": rows}
+        return {"divisions": divisions, "months": target_months, "rows": rows}
     except Exception as e:
         logger.error(f"Error in division-month-cy26: {e}")
         return {"divisions": [], "months": [], "rows": [], "error": str(e)}
@@ -890,7 +886,7 @@ def one_pager(
     if cy == "CY26":
         if month:
             # Need GSheet if any selected month is outside CSV coverage
-            need_gsheet = any(m not in CY26_CSV_MONTHS for m in month)
+            need_gsheet = any(m not in CY26_COMPARISON_MONTHS for m in month)
         else:
             # No month filter → include April from GSheet as well
             need_gsheet = True
@@ -950,7 +946,7 @@ def one_pager(
                     gdf[col] = 0.0
 
             # Only keep months NOT already in CY26 CSV to avoid duplicates
-            gsheet_df = gdf[~gdf["Month"].isin(CY26_CSV_MONTHS)].copy()
+            gsheet_df = gdf[~gdf["Month"].isin(CY26_COMPARISON_MONTHS)].copy()
         except Exception:
             gsheet_df = None
 
@@ -1402,7 +1398,7 @@ def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Renault Service Revenue Dashboard v8</title>
+<title>Renault Service Revenue Dashboard v9</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -2518,7 +2514,7 @@ async function loadCurrentMonth() {
     if (!window._cmJsLoaded) {
         await new Promise(function(resolve, reject) {
             var s = document.createElement("script");
-            s.src = "/cm.js?v=3";
+            s.src = "/cm.js?v=4";
             s.onload = resolve;
             s.onerror = reject;
             document.head.appendChild(s);
