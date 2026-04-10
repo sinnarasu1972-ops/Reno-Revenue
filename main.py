@@ -30,7 +30,6 @@ CURRENT_MONTH_LABEL = "April 2026"
 CURRENT_MONTH_TAB   = "Current Month (Apr)"
 
 # CY26 CSV covers Jan-Mar. 
-# We define the target months for the CY26 comparison explicitly here.
 CY26_COMPARISON_MONTHS = ["Jan", "Feb", "Mar"]
 
 # ---------------- HELPERS ----------------
@@ -134,14 +133,25 @@ def load_data():
     if "Vehicle Model" in df.columns:
         df["Model"] = df["Vehicle Model"].fillna("").astype(str).str.strip().str.split().str[0].str.upper()
 
+    # --- FIX: Date Parsing for DD/MM/YYYY ---
+    # The user specified format is DD/MM/YYYY HH:mm.
+    # We will try parsing with '/' first (dayfirst=True is crucial to avoid US format confusion).
     for date_col in ["Invoice Date", "Repair Order Date"]:
         if date_col not in df.columns:
             continue
+        # Take first 10 chars: "DD/MM/YYYY"
         raw = df[date_col].astype(str).str.strip().str[:10]
-        parsed = pd.to_datetime(raw, format="%d-%m-%Y", errors="coerce")
-        mask = parsed.isna()
-        if mask.any():
-            parsed[mask] = pd.to_datetime(raw[mask], format="%d/%m/%Y", errors="coerce")
+        
+        # Attempt 1: DD/MM/YYYY (most likely based on user input)
+        # dayfirst=True ensures 01/03/2026 is parsed as March 1st, not Jan 3rd.
+        parsed = pd.to_datetime(raw, format="%d/%m/%Y", dayfirst=True, errors="coerce")
+        
+        # Attempt 2: Fallback to DD-MM-YYYY (Hyphen)
+        if parsed.isna().any():
+            mask = parsed.isna()
+            # Only retry failed ones
+            parsed[mask] = pd.to_datetime(raw[mask], format="%d-%m-%Y", errors="coerce")
+            
         df[date_col] = parsed
 
     if "Invoice Date" in df.columns:
@@ -170,8 +180,6 @@ def load_data():
     gc.collect()
     
     # --- FIX: Robust Detection of Months for Comparison ---
-    # We verify that our target months (Jan, Feb, Mar) exist in the CSV.
-    # If Month column failed to parse, this will be empty.
     cy26_mask = df["CY"] == "CY26"
     detected_months = []
     if cy26_mask.any():
@@ -214,7 +222,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown.")
 
 
-app = FastAPI(title="Renault Revenue", version="18.0", lifespan=lifespan)
+app = FastAPI(title="Renault Revenue", version="19.0", lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
@@ -691,8 +699,6 @@ def export_division_month_cy26(
     model:    list[str] = Query(None),
 ):
     # --- LOGIC CHANGE: EXPLICITLY USE JAN, FEB, MAR ---
-    # We use the global list which was verified at startup.
-    # But to be absolutely safe for the export, we ensure we iterate Jan, Feb, Mar.
     target_months = ["Jan", "Feb", "Mar"]
     
     data = df.copy()
@@ -832,7 +838,6 @@ def division_month_cy26(
 ):
     try:
         # --- FIX: Explicitly define Jan, Feb, Mar for the response ---
-        # We do not rely solely on the dynamic global variable to ensure March appears if requested.
         target_months = ["Jan", "Feb", "Mar"]
         
         data = df.copy()
@@ -925,11 +930,14 @@ def one_pager(
             if "Vehicle Model" in gdf.columns:
                 gdf["Model"] = gdf["Vehicle Model"].astype(str).str.strip().str.split().str[0].str.upper()
 
+            # Handle GSheet Date Format (usually DD-MM-YYYY or DD/MM/YYYY)
             raw_date = gdf["Invoice Date"].astype(str).str.strip().str[:10]
             gdf["Invoice Date"] = pd.to_datetime(raw_date, format="%d-%m-%Y", errors="coerce")
             mask = gdf["Invoice Date"].isna()
             if mask.any():
+                # Try DD/MM/YYYY
                 gdf.loc[mask, "Invoice Date"] = pd.to_datetime(raw_date[mask], format="%d/%m/%Y", errors="coerce")
+            
             gdf["Month"] = gdf["Invoice Date"].dt.strftime("%b")
             gdf["CY"] = "CY26"
 
@@ -1191,7 +1199,7 @@ async function _loadCurrentMonth() {
             "<td>" + fi(gI25) + "</td><td style=color:#15803d>" + fi(gI26) + "</td><td>" + gpBadge(gI25,gI26) + "</td>" +
             "<td>" + fc(gL25) + "</td><td style=color:#15803d>" + fc(gL26) + "</td><td>" + gpBadge(gL25,gL26) + "</td>" +
             "<td>" + fc(gS25) + "</td><td style=color:#15803d>" + fc(gS26) + "</td><td>" + gpBadge(gS25,gS26) + "</td>" +
-            "<td>" + fc(gL25+gS25) + "</td><td style=color:#15803d>" + fc(gL26+gS26) + "</td><td>" + gpBadge(gL25+gS25,gL26+gS26) + "</td>" +
+            "<td>" + fc(gL25+gS25) + "</td><td style=color:#15803d>" + fc(gL26+gS26) + "</td><td>" + gpBadge(gL25+gS25,gL26+S26) + "</td>" +
             "</tr>";
 
         document.getElementById("cm-div-tbody").innerHTML = divHtml;
@@ -1376,7 +1384,7 @@ def current_month(
             "cy25_labour":  indian_format(cy25_mtd_labour),
             "labour_pct":   pct(labour, cy25_mtd_labour),
             "cy26_spares":  indian_format(spares),
-            "cy25_spares":  indian_format(cy25_mtd_spares),
+            "cy25_spares": indian_format(cy25_mtd_spares),
             "spares_pct":   pct(spares, cy25_mtd_spares),
             "cy26_total":   indian_format(labour + spares),
             "cy25_total":   indian_format(cy25_mtd_labour + cy25_mtd_spares),
@@ -1398,7 +1406,7 @@ def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Renault Service Revenue Dashboard v9</title>
+<title>Renault Service Revenue Dashboard v10</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1751,7 +1759,7 @@ tbody tr:hover { background: #f4f6ff; }
       <div class="card"><div class="label">Inflow CY24</div><div class="value" id="inflow24">…</div></div>
       <div class="card"><div class="label">Inflow CY25</div><div class="value" id="inflow25">…</div></div>
       <div class="card"><div class="label">Inflow CY26</div><div class="value" id="inflow26">…</div></div>
-      <div class="card"><div class="label">Total Labour</div><div class="value" id="labour">…</div></div>
+      <div class="child"><div class="label">Total Labour</div><div class="value" id="labour">…</div></div>
       <div class="card"><div class="label">Total Spares</div><div class="value" id="spares">…</div></div>
       <div class="card" style="border: 2px solid #4f6bdc;"><div class="label">Total Revenue</div><div class="value" id="total-rev">…</div></div>
     </div>
@@ -1797,7 +1805,7 @@ tbody tr:hover { background: #f4f6ff; }
       <div class="fg"><label>Service Type</label><div class="custom-select" id="cs2-service" data-key="c-service" data-placeholder="All Service Types"></div></div>
       <div class="fg"><label>SA Name</label><div class="custom-select" id="cs2-sa" data-key="c-sa" data-placeholder="All SAs"></div></div>
       <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs2-invoice" data-key="c-invoice" data-placeholder="All Invoice Types"></div></div>
-      <div class="fg"><label>Model</label><div class="custom-select" id="cs2-model" data-key="c-model" data-placeholder="All Models"></div></div>
+      <div class="fg"><label>Model</label><div class="custom-select" id="c2-model" data-key="c-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyComparison()">Apply</button>
       <button class="export-btn" id="export-btn-p2" onclick="exportPage2()">Export Excel</button>
       <button class="reset-btn"  onclick="resetPage2()">Reset</button>
@@ -1969,7 +1977,7 @@ tbody tr:hover { background: #f4f6ff; }
       <div class="fg"><label>Division</label><div class="custom-select" id="cs6-division" data-key="d6-division" data-placeholder="All Divisions"></div></div>
       <div class="fg"><label>Service Type</label><div class="custom-select" id="cs6-service" data-key="d6-service" data-placeholder="All Service Types"></div></div>
       <div class="fg"><label>SA Name</label><div class="custom-select" id="cs6-sa" data-key="d6-sa" data-placeholder="All SAs"></div></div>
-      <div class="fg"><label>Invoice Type</label><div class="custom-select" id="cs6-invoice" data-key="d6-invoice" data-placeholder="All Invoice Types"></div></div>
+      <div class="fg"><label>Invoice Type</label><div class="select">
       <div class="fg"><label>Model</label><div class="custom-select" id="cs6-model" data-key="d6-model" data-placeholder="All Models"></div></div>
       <button class="apply-btn"  onclick="applyDivMonth26()">Apply</button>
       <button class="export-btn" id="export-btn-p6" onclick="exportPage6()">Export Excel</button>
@@ -2002,7 +2010,7 @@ function switchTab(pageId, btn) {
     if (pageId === "page3" && !divMonLoaded) { loadDivMonth(); divMonLoaded = true; }
     if (pageId === "page4") { loadOnePager(); }
     if (pageId === "page5") { loadCurrentMonth(); }
-    if (pageId === "page6" && !dm26Loaded) { loadDivMonth26(); dm26Loaded = true; }
+    if (pageId === "page6" && !dm26Loaded) { loadDivMonth26(); dm26 = true; }
 }
 
 /* ====================================================
@@ -2099,7 +2107,7 @@ function updateFace(key) {
 }
 
 document.addEventListener("click", function(e) {
-    if (e.target.closest && (e.target.closest(".cs-panel") || e.target.closest(".cs-face"))) return;
+    if (e.target.closest && (e.target.closest(".cs-panel") || e.target="closeAllPanels"))) return;
     closeAllPanels();
 });
 
@@ -2147,12 +2155,12 @@ async function loadFilters() {
         fillCustomSelect("d-division", data.division);
         fillCustomSelect("d-service",  data.service);
         fillCustomSelect("d-sa",       data.sa);
-        fillCustomSelect("d-invoice",  data.invoice);
+        fillCustomSelect("d-invoice", data.invoice);
         fillCustomSelect("d-model",    data.model);
         fillCustomSelect("op-division", data.division);
         fillCustomSelect("op-service",  data.service);
         fillCustomSelect("op-sa",       data.sa);
-        fillCustomSelect("op-invoice",  data.invoice);
+        fillCustomSelect("op-invoice", data.invoice);
         fillCustomSelect("op-model",    data.model);
         fillCustomSelect("op-month",    data.month);
         fillCustomSelect("cm-division", data.division);
@@ -2514,7 +2522,7 @@ async function loadCurrentMonth() {
     if (!window._cmJsLoaded) {
         await new Promise(function(resolve, reject) {
             var s = document.createElement("script");
-            s.src = "/cm.js?v=4";
+            s.src = "/cm.js?v=5";
             s.onload = resolve;
             s.onerror = reject;
             document.head.appendChild(s);
@@ -2672,7 +2680,7 @@ var filterGroups = {
     "c-division":  [null,    ["c-service","c-sa","c-invoice","c-model"]],
     "d-division":  [null,    ["d-service","d-sa","d-invoice","d-model"]],
     "d6-division": [null,    ["d6-service","d6-sa","d6-invoice","d6-model"]],
-    "op-division": ["op-cy", ["op-service","op-sa","op-invoice","op-model","op-month"]],
+    "op-division": ["op-cy", ["op-service","op-sa","op-invoice","op-model","op-month"],
     "cm-division": [null,    ["cm-service","cm-sa","cm-model"]],
 };
 var DIV_KEYS = ["division","c-division","d-division","d6-division","op-division","cm-division"];
