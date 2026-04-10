@@ -30,7 +30,8 @@ CURRENT_MONTH_LABEL = "April 2026"
 CURRENT_MONTH_TAB   = "Current Month (Apr)"
 
 # CY26 CSV covers Jan-Mar. April onwards → Google Sheet only.
-CY26_CSV_MONTHS = {"Jan", "Feb", "Mar"}   # populated also from actual data at startup
+# We will enforce Jan, Feb, Mar for the specific CY26 comparison page.
+CY26_CSV_MONTHS = {"Jan", "Feb", "Mar"}   
 
 # ---------------- HELPERS ----------------
 
@@ -169,11 +170,11 @@ def load_data():
     gc.collect()
     logger.info(f"RAM after enrich: {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
 
-    # Populate CY26_CSV_MONTHS from actual data
+    # Populate CY26_CSV_MONTHS from actual data (should be Jan, Feb, Mar)
     cy26_mask = df["CY"] == "CY26"
     if cy26_mask.any():
         CY26_CSV_MONTHS = set(df.loc[cy26_mask, "Month"].dropna().unique().tolist())
-    logger.info(f"CY26 CSV months: {CY26_CSV_MONTHS}")
+    logger.info(f"CY26 CSV months detected: {CY26_CSV_MONTHS}")
 
     status_col = next(
         (c for c in df.columns if c.strip().lower() in ("status", "invoice status", "ro status")),
@@ -205,7 +206,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown.")
 
 
-app = FastAPI(title="Renault Revenue", version="16.0", lifespan=lifespan)
+app = FastAPI(title="Renault Revenue", version="17.0", lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
@@ -681,27 +682,39 @@ def export_division_month_cy26(
     invoice:  list[str] = Query(None),
     model:    list[str] = Query(None),
 ):
-    MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    # LOGIC CHANGE: Explicitly limit comparison months to Jan, Feb, Mar for CY26
+    # But we keep CY25 full year context if needed, or limit similarly.
+    # Based on request: "add March month comparision in Division-Month CY26 page".
+    # We will use the months found in the CY26 CSV (Jan, Feb, Mar).
+    
+    # We filter data first to ensure we only look at CY26 months that actually exist (Jan, Feb, Mar)
+    # For the "Year Over Year" view, we will compare CY25 (Jan, Feb, Mar) vs CY26 (Jan, Feb, Mar)
+    
+    comparison_months = sorted(CY26_CSV_MONTHS, key=lambda x: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].index(x))
+    
     data = df.copy()
     canc = df_cancelled.copy()
+    
+    # Apply Filters
     if division: data = data[data["Division"].isin(division)]; canc = canc[canc["Division"].isin(division)]
     if service:  data = data[data["Service Type"].isin(service)]; canc = canc[canc["Service Type"].isin(service)]
     if sa:       data = data[data["SA Name"].isin(sa)];         canc = canc[canc["SA Name"].isin(sa)]
     if invoice:  data = data[data["Invoice Type"].isin(invoice)]; canc = canc[canc["Invoice Type"].isin(invoice)]
     if model:    data = data[data["Model"].isin(model)];        canc = canc[canc["Model"].isin(model)]
 
-    cy26_months = sorted(
-        data[data["CY"] == "CY26"]["Month"].dropna().unique().tolist(),
-        key=lambda m: MONTHS.index(m) if m in MONTHS else 99
-    )
     divisions = sorted(data["Division"].dropna().unique().tolist())
     rows = []
+    
     for div in divisions:
         dd = data[data["Division"] == div]
         row = {"Division": div}
-        for m in cy26_months:
+        
+        # We only iterate over the months present in CY26 CSV (Jan, Feb, Mar)
+        for m in comparison_months:
+            # Compare CY25 same month vs CY26 same month
             m25 = dd[(dd["CY"] == "CY25") & (dd["Month"] == m)]
             m26 = dd[(dd["CY"] == "CY26") & (dd["Month"] == m)]
+            
             row[f"Inflow CY25 {m}"] = int(m25["Repair Order#"].nunique())
             row[f"Inflow CY26 {m}"] = int(m26["Repair Order#"].nunique())
             row[f"Labour CY25 {m}"] = round(float(m25["Net Taxable Labor Amount"].sum()), 2)
@@ -815,7 +828,9 @@ def division_month_cy26(
     model:    list[str] = Query(None),
 ):
     try:
-        MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        # LOGIC CHANGE: Explicitly use only months that exist in CY26 CSV (Jan, Feb, Mar)
+        MONTHS = ["Jan","Feb","Mar"]
+        
         data = df.copy()
         if division: data = data[data["Division"].isin(division)]
         if service:  data = data[data["Service Type"].isin(service)]
@@ -823,19 +838,25 @@ def division_month_cy26(
         if invoice:  data = data[data["Invoice Type"].isin(invoice)]
         if model:    data = data[data["Model"].isin(model)]
 
-        # Only show months that exist in CY26 CSV (Jan, Feb, Mar)
+        # Verify months exist in CY26 data to avoid empty columns
         cy26_months = sorted(
             data[data["CY"] == "CY26"]["Month"].dropna().unique().tolist(),
             key=lambda m: MONTHS.index(m) if m in MONTHS else 99
         )
+        # Ensure we stick to the requested months even if one is missing from data (it will just be 0)
+        final_months = [m for m in MONTHS if m in CY26_CSV_MONTHS] # Intersect request and data availability
+
         divisions = sorted(data["Division"].dropna().unique().tolist())
         rows = []
+        
         for div in divisions:
             div_data = data[data["Division"] == div]
             row = {"division": div}
-            for month in cy26_months:
+            for month in final_months:
+                # Compare CY25 (Same Month) vs CY26 (Same Month)
                 m25 = div_data[(div_data["CY"] == "CY25") & (div_data["Month"] == month)]
                 m26 = div_data[(div_data["CY"] == "CY26") & (div_data["Month"] == month)]
+                
                 row[f"i25_{month}"] = int(m25["Repair Order#"].nunique())
                 row[f"i26_{month}"] = int(m26["Repair Order#"].nunique())
                 row[f"l25_{month}"] = float(m25["Net Taxable Labor Amount"].sum())
@@ -845,8 +866,10 @@ def division_month_cy26(
                 row[f"t25_{month}"] = row[f"l25_{month}"] + row[f"s25_{month}"]
                 row[f"t26_{month}"] = row[f"l26_{month}"] + row[f"s26_{month}"]
             rows.append(row)
-        return {"divisions": divisions, "months": cy26_months, "rows": rows}
+            
+        return {"divisions": divisions, "months": final_months, "rows": rows}
     except Exception as e:
+        logger.error(f"Error in division-month-cy26: {e}")
         return {"divisions": [], "months": [], "rows": [], "error": str(e)}
 
 # ---------------- ONE PAGER ----------------
@@ -1379,7 +1402,7 @@ def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Renault Service Revenue Dashboard v7</title>
+<title>Renault Service Revenue Dashboard v8</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -2495,7 +2518,7 @@ async function loadCurrentMonth() {
     if (!window._cmJsLoaded) {
         await new Promise(function(resolve, reject) {
             var s = document.createElement("script");
-            s.src = "/cm.js?v=2";
+            s.src = "/cm.js?v=3";
             s.onload = resolve;
             s.onerror = reject;
             document.head.appendChild(s);
